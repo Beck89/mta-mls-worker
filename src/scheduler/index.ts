@@ -187,7 +187,7 @@ export function createScheduler() {
       // Initialize shared services
       createRateLimiter();
       createR2Client();
-      const downloader = createMediaDownloader();
+      createMediaDownloader(); // Initialize singleton (kept for potential fallback use)
 
       // Initialize rate limiter from DB history (for restart recovery)
       // This is a best-effort initialization — empty counters are safe
@@ -222,7 +222,10 @@ export function createScheduler() {
         logger.warn({ err }, 'Failed to initialize rate limiter from history (starting fresh)');
       }
 
-      // Start media download loop
+      // Media is primarily downloaded inline during record processing (URLs expire ~11h).
+      // The decoupled media download loop runs as a fallback to process any
+      // pending_download rows from previous runs or edge cases.
+      const downloader = getMediaDownloader();
       await downloader.start();
 
       // Run initial import if needed

@@ -13,10 +13,14 @@ import {
   transformMediaRecords,
   stripExpandedResources,
 } from '../transform/property-mapper.js';
-import type { MlsGridPropertyRecord } from '../transform/property-mapper.js';
-import { batchDeleteFromR2 } from '../storage/r2-client.js';
+import type { MlsGridPropertyRecord, MlsGridMediaRecord } from '../transform/property-mapper.js';
+import { batchDeleteFromR2, uploadToR2, buildR2ObjectKey, buildPublicUrl } from '../storage/r2-client.js';
+import { downloadMedia, MlsGridApiError } from '../api/mlsgrid-client.js';
 import { getLogger } from '../lib/logger.js';
 import { notifyIfNeeded } from '../alerts/notify.js';
+
+const MEDIA_DOWNLOAD_STAGGER_MS = 200; // Delay between sequential media downloads
+const MEDIA_MAX_RETRIES = 3;
 
 export interface ProcessingStats {
   inserted: number;
@@ -122,7 +126,7 @@ export async function processPropertyRecord(
     await db.insert(unitTypes).values(unitTypeRows);
   }
 
-  // Step 6: QUEUE MEDIA (after property exists for FK)
+  // Step 6: DOWNLOAD MEDIA INLINE (URLs expire ~11h, must download immediately)
   const mediaRecords = raw.Media;
   const photosChanged =
     isNew ||
@@ -131,8 +135,8 @@ export async function processPropertyRecord(
       existingRecord.photosChangeTs?.toISOString() !== new Date(raw.PhotosChangeTimestamp).toISOString());
 
   if (photosChanged && mediaRecords && mediaRecords.length > 0) {
-    await queueMediaUpdates(listingKey, mediaRecords, existingRecord);
-    stats.mediaQueued = mediaRecords.length;
+    const mediaResult = await downloadMediaInline(listingKey, 'Property', mediaRecords, existingRecord);
+    stats.mediaQueued = mediaResult.downloaded + mediaResult.failed;
   }
 
   if (isNew) {
@@ -296,16 +300,21 @@ async function recordDiffs(
 }
 
 /**
- * Queue media updates: upsert media rows with pending_download status.
+ * Download media inline during record processing.
+ * URLs expire ~11h after receipt, so we download immediately while they're fresh.
  * Also handles deletion of media that no longer exists.
  */
-async function queueMediaUpdates(
+async function downloadMediaInline(
   listingKey: string,
-  incomingMedia: NonNullable<MlsGridPropertyRecord['Media']>,
+  resourceType: string,
+  incomingMedia: MlsGridMediaRecord[],
   _existingRecord: typeof properties.$inferSelect | null,
-): Promise<void> {
+): Promise<{ downloaded: number; failed: number; skipped: number }> {
   const db = getDb();
   const logger = getLogger();
+  let downloaded = 0;
+  let failed = 0;
+  let skipped = 0;
 
   // Get existing media keys for this listing
   const existingMedia = await db
@@ -313,50 +322,166 @@ async function queueMediaUpdates(
     .from(media)
     .where(eq(media.listingKey, listingKey));
 
-  const existingMediaMap = new Map(existingMedia.map((m) => [m.mediaKey, m]));
+  const existingMediaMap = new Map(existingMedia.map((m: { mediaKey: string; mediaModTs: Date | null; r2ObjectKey: string }) => [m.mediaKey, m]));
   const incomingMediaKeys = new Set(incomingMedia.map((m) => m.MediaKey).filter(Boolean));
 
   // Find media to delete (no longer in incoming data)
-  const mediaToDelete = existingMedia.filter((m) => !incomingMediaKeys.has(m.mediaKey));
+  const mediaToDelete = existingMedia.filter((m: { mediaKey: string; r2ObjectKey: string }) => !incomingMediaKeys.has(m.mediaKey));
   if (mediaToDelete.length > 0) {
-    const r2Keys = mediaToDelete.map((m) => m.r2ObjectKey);
+    const r2Keys = mediaToDelete.map((m: { r2ObjectKey: string }) => m.r2ObjectKey);
     try {
       await batchDeleteFromR2(r2Keys);
     } catch (err) {
       logger.error({ err, listingKey, count: r2Keys.length }, 'Failed to delete removed media from R2');
     }
     for (const m of mediaToDelete) {
-      await db.delete(media).where(eq(media.mediaKey, m.mediaKey));
+      await db.delete(media).where(eq(media.mediaKey, (m as { mediaKey: string }).mediaKey));
     }
   }
 
-  // Upsert incoming media
-  const newMediaRows = transformMediaRecords(listingKey, 'Property', incomingMedia);
-  for (const row of newMediaRows) {
+  // Process each incoming media record: upsert metadata + download + upload to R2
+  const mediaRows = transformMediaRecords(listingKey, resourceType, incomingMedia);
+
+  for (let i = 0; i < mediaRows.length; i++) {
+    const row = mediaRows[i];
+    const rawMedia = incomingMedia[i];
     const existingRow = existingMediaMap.get(row.mediaKey);
 
-    // Only queue for download if new or MediaModificationTimestamp changed
+    // Check if download is needed (new or MediaModificationTimestamp changed)
     const needsDownload =
       !existingRow ||
       (row.mediaModTs &&
         existingRow.mediaModTs?.toISOString() !== row.mediaModTs.toISOString());
 
-    await db
-      .insert(media)
-      .values({
-        ...row,
-        status: needsDownload ? 'pending_download' : 'complete',
-      })
-      .onConflictDoUpdate({
-        target: media.mediaKey,
-        set: {
-          mediaUrlSource: row.mediaUrlSource,
-          mediaModTs: row.mediaModTs,
-          mediaOrder: row.mediaOrder,
-          mediaCategory: row.mediaCategory,
-          status: needsDownload ? 'pending_download' : undefined,
-          updatedAt: new Date(),
-        },
-      });
+    if (!needsDownload) {
+      // Media unchanged — just update metadata
+      await db
+        .insert(media)
+        .values({ ...row, status: 'complete' })
+        .onConflictDoUpdate({
+          target: media.mediaKey,
+          set: {
+            mediaOrder: row.mediaOrder,
+            mediaCategory: row.mediaCategory,
+            updatedAt: new Date(),
+          },
+        });
+      skipped++;
+      continue;
+    }
+
+    const mediaUrl = rawMedia.MediaURL;
+    if (!mediaUrl) {
+      // No URL — insert as failed
+      await db
+        .insert(media)
+        .values({ ...row, status: 'failed' })
+        .onConflictDoUpdate({
+          target: media.mediaKey,
+          set: { status: 'failed', updatedAt: new Date() },
+        });
+      failed++;
+      continue;
+    }
+
+    // Download and upload with retry
+    let success = false;
+    for (let attempt = 0; attempt < MEDIA_MAX_RETRIES; attempt++) {
+      try {
+        const result = await downloadMedia(mediaUrl);
+
+        // Build R2 key with actual content type
+        const r2ObjectKey = buildR2ObjectKey(resourceType, listingKey, row.mediaKey, result.contentType);
+        const publicUrl = buildPublicUrl(r2ObjectKey);
+
+        // Upload to R2
+        await uploadToR2(r2ObjectKey, result.buffer, result.contentType);
+
+        // Upsert media row as complete
+        await db
+          .insert(media)
+          .values({
+            ...row,
+            status: 'complete',
+            r2ObjectKey,
+            publicUrl,
+            fileSizeBytes: result.bytes,
+            contentType: result.contentType,
+          })
+          .onConflictDoUpdate({
+            target: media.mediaKey,
+            set: {
+              status: 'complete',
+              r2ObjectKey,
+              publicUrl,
+              mediaUrlSource: row.mediaUrlSource,
+              mediaModTs: row.mediaModTs,
+              mediaOrder: row.mediaOrder,
+              fileSizeBytes: result.bytes,
+              contentType: result.contentType,
+              updatedAt: new Date(),
+            },
+          });
+
+        downloaded++;
+        success = true;
+
+        logger.debug(
+          { mediaKey: row.mediaKey, bytes: result.bytes, listingKey },
+          'Media downloaded inline',
+        );
+        break;
+      } catch (err) {
+        const is429 = err instanceof MlsGridApiError && err.statusCode === 429;
+        if (is429 && attempt < MEDIA_MAX_RETRIES - 1) {
+          // Wait longer on 429
+          const waitMs = 30_000 * (attempt + 1); // 30s, 60s, 90s
+          logger.warn(
+            { mediaKey: row.mediaKey, attempt: attempt + 1, waitMs },
+            'Media download 429 — waiting before retry',
+          );
+          await sleep(waitMs);
+          continue;
+        }
+        if (attempt < MEDIA_MAX_RETRIES - 1) {
+          // Non-429 error — brief backoff
+          await sleep(2_000 * (attempt + 1));
+          continue;
+        }
+        // Final attempt failed
+        logger.error(
+          { mediaKey: row.mediaKey, listingKey, err: (err as Error).message },
+          'Media download failed after retries',
+        );
+      }
+    }
+
+    if (!success) {
+      // Insert/update as failed
+      await db
+        .insert(media)
+        .values({ ...row, status: 'failed' })
+        .onConflictDoUpdate({
+          target: media.mediaKey,
+          set: { status: 'failed', retryCount: MEDIA_MAX_RETRIES, updatedAt: new Date() },
+        });
+      failed++;
+    }
+
+    // Stagger between downloads to avoid CDN rate limits
+    if (i < mediaRows.length - 1) {
+      await sleep(MEDIA_DOWNLOAD_STAGGER_MS);
+    }
   }
+
+  logger.info(
+    { listingKey, downloaded, failed, skipped, total: mediaRows.length },
+    'Media processing complete for listing',
+  );
+
+  return { downloaded, failed, skipped };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
