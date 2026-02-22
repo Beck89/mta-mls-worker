@@ -29,7 +29,7 @@ CREATE TABLE "properties" (
 	"waterfront_yn" boolean,
 	"horse_yn" boolean,
 	"association_yn" boolean,
-	"geog" "geography(POINT, 4326)",
+	"geog" geography(POINT, 4326),
 	"latitude" numeric,
 	"longitude" numeric,
 	"street_number" varchar,

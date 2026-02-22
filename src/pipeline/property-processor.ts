@@ -70,26 +70,14 @@ export async function processPropertyRecord(
     await recordDiffs(listingKey, existingRecord, raw);
   }
 
-  // Step 4: QUEUE MEDIA
-  const mediaRecords = raw.Media;
-  const photosChanged =
-    isNew ||
-    (existingRecord &&
-      raw.PhotosChangeTimestamp &&
-      existingRecord.photosChangeTs?.toISOString() !== new Date(raw.PhotosChangeTimestamp).toISOString());
-
-  if (photosChanged && mediaRecords && mediaRecords.length > 0) {
-    await queueMediaUpdates(listingKey, mediaRecords, existingRecord);
-    stats.mediaQueued = mediaRecords.length;
-  }
-
-  // Step 5: PROCESS ROOMS AND UNIT_TYPES
+  // Step 4: TRANSFORM data
+  const transformed = transformProperty(raw);
+  const rawData = stripExpandedResources(raw as Record<string, unknown>);
   const roomRows = transformRooms(listingKey, raw.Rooms);
   const unitTypeRows = transformUnitTypes(listingKey, raw.UnitTypes);
 
-  // Step 6: UPSERT property + raw_response (SINGLE TRANSACTION)
-  const transformed = transformProperty(raw);
-  const rawData = stripExpandedResources(raw as Record<string, unknown>);
+  // Step 5: UPSERT property + rooms + unit_types + raw_response
+  // Property must be upserted BEFORE media (FK constraint)
 
   // Delete existing rooms/unit_types and re-insert (replace strategy)
   await db.delete(rooms).where(eq(rooms.listingKey, listingKey));
@@ -132,6 +120,19 @@ export async function processPropertyRecord(
   // Insert unit types
   if (unitTypeRows.length > 0) {
     await db.insert(unitTypes).values(unitTypeRows);
+  }
+
+  // Step 6: QUEUE MEDIA (after property exists for FK)
+  const mediaRecords = raw.Media;
+  const photosChanged =
+    isNew ||
+    (existingRecord &&
+      raw.PhotosChangeTimestamp &&
+      existingRecord.photosChangeTs?.toISOString() !== new Date(raw.PhotosChangeTimestamp).toISOString());
+
+  if (photosChanged && mediaRecords && mediaRecords.length > 0) {
+    await queueMediaUpdates(listingKey, mediaRecords, existingRecord);
+    stats.mediaQueued = mediaRecords.length;
   }
 
   if (isNew) {
