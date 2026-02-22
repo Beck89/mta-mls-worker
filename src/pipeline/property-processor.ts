@@ -437,6 +437,17 @@ async function downloadMediaInline(
         break;
       } catch (err) {
         const is429 = err instanceof MlsGridApiError && err.statusCode === 429;
+        const isExpiredUrl = err instanceof MlsGridApiError && (err.statusCode === 400 || err.statusCode === 403);
+
+        if (isExpiredUrl) {
+          // 400/403 = URL token expired. No point retrying — URL is dead.
+          // recoverFailedMedia() on next startup will fetch a fresh URL.
+          logger.debug(
+            { mediaKey: row.mediaKey, listingKey, statusCode: (err as MlsGridApiError).statusCode },
+            'Media URL expired (400/403) — skipping retries',
+          );
+          break;
+        }
         if (is429 && attempt < MEDIA_MAX_RETRIES - 1) {
           // Wait longer on 429
           const waitMs = 30_000 * (attempt + 1); // 30s, 60s, 90s

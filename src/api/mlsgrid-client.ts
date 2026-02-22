@@ -186,17 +186,23 @@ export async function* fetchAllPages<T = Record<string, unknown>>(
 /**
  * Download a media file from a MediaURL. Returns the response body as a buffer.
  * Media downloads do NOT count against API request limits but DO count against bandwidth.
+ * Authorization header is required — MLS Grid CDN validates the Bearer token.
  */
 export async function downloadMedia(
   mediaUrl: string,
 ): Promise<{ buffer: Buffer; contentType: string; bytes: number }> {
+  const env = getEnv();
   const rateLimiter = getRateLimiter();
   const logger = getLogger();
 
   // Check media bandwidth (not API request count)
   await rateLimiter.waitForMediaSlot();
 
-  const response = await fetch(mediaUrl);
+  const response = await fetch(mediaUrl, {
+    headers: {
+      Authorization: `Bearer ${env.MLSGRID_API_TOKEN}`,
+    },
+  });
 
   if (!response.ok) {
     throw new MlsGridApiError(

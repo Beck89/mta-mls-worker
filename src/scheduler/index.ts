@@ -228,6 +228,11 @@ export function createScheduler() {
       const downloader = getMediaDownloader();
       await downloader.start();
 
+      // Recover any failed/expired media from previous runs before starting replication.
+      // This fetches fresh MediaURLs from the API for expired items and re-downloads them.
+      // Rate limits are honoured automatically via the shared downloadMedia()/fetchPage() helpers.
+      await downloader.recoverFailedMedia();
+
       // Run initial import if needed
       await runInitialImport();
 

@@ -1,8 +1,9 @@
-import { eq } from 'drizzle-orm';
+import { eq, inArray, or } from 'drizzle-orm';
 import { getDb } from '../db/connection.js';
 import { media } from '../db/schema/media.js';
+import { properties } from '../db/schema/properties.js';
 import { mediaDownloads } from '../db/schema/monitoring.js';
-import { downloadMedia, MlsGridApiError } from '../api/mlsgrid-client.js';
+import { downloadMedia, fetchPage, MlsGridApiError } from '../api/mlsgrid-client.js';
 import { uploadToR2, buildR2ObjectKey, buildPublicUrl } from '../storage/r2-client.js';
 import { getLogger } from '../lib/logger.js';
 import { getEnv } from '../config/env.js';
@@ -81,6 +82,218 @@ export class MediaDownloader {
   stop(): void {
     this.running = false;
     getLogger().info('Media download loop stopping');
+  }
+
+  /**
+   * Startup recovery: find all failed/expired media rows and re-download them.
+   *
+   * For each failed row:
+   *   1. Parse the `expires=` timestamp from the stored mediaUrlSource.
+   *   2. If the URL is still valid → download immediately (rate-limited via downloadMedia).
+   *   3. If the URL is expired → group by listingKey, fetch a fresh Property record from
+   *      the MLS Grid API (rate-limited via fetchPage) to get a new MediaURL, then download.
+   *
+   * This runs synchronously before the replication loops start so that the backlog
+   * is cleared before new work arrives. All existing rate limiter guards are honoured
+   * because we go through the same downloadMedia() / fetchPage() helpers.
+   */
+  async recoverFailedMedia(): Promise<void> {
+    const db = getDb();
+    const logger = getLogger();
+    const env = getEnv();
+
+    // 1. Load all failed / expired media rows
+    const failedRows = await db
+      .select({
+        mediaKey: media.mediaKey,
+        listingKey: media.listingKey,
+        resourceType: media.resourceType,
+        mediaUrlSource: media.mediaUrlSource,
+      })
+      .from(media)
+      .where(or(eq(media.status, 'failed'), eq(media.status, 'expired')));
+
+    if (failedRows.length === 0) {
+      logger.info('Media recovery: no failed/expired rows found — skipping');
+      return;
+    }
+
+    logger.info({ count: failedRows.length }, 'Media recovery: starting failed media re-download');
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const URL_EXPIRY_BUFFER_SEC = 60; // treat URLs expiring within 60s as expired
+
+    // Separate rows into "URL still valid" vs "URL expired / unknown"
+    const stillValid: typeof failedRows = [];
+    const needFreshUrl: typeof failedRows = [];
+
+    for (const row of failedRows) {
+      if (!row.mediaUrlSource) {
+        // No URL at all — can't recover without a fresh API fetch
+        needFreshUrl.push(row);
+        continue;
+      }
+      const expiresAt = parseUrlExpiry(row.mediaUrlSource);
+      if (expiresAt !== null && expiresAt > nowSec + URL_EXPIRY_BUFFER_SEC) {
+        stillValid.push(row);
+      } else {
+        needFreshUrl.push(row);
+      }
+    }
+
+    logger.info(
+      { stillValid: stillValid.length, needFreshUrl: needFreshUrl.length },
+      'Media recovery: URL validity split',
+    );
+
+    // 2. Download rows whose stored URL is still valid
+    let recovered = 0;
+    let stillFailed = 0;
+
+    for (const row of stillValid) {
+      const ok = await this.recoverOne(row, row.mediaUrlSource!);
+      if (ok) recovered++; else stillFailed++;
+    }
+
+    // 3. For expired URLs, group by listingKey and fetch fresh Property records
+    if (needFreshUrl.length > 0) {
+      // Group by listingKey
+      const byListing = new Map<string, typeof failedRows>();
+      for (const row of needFreshUrl) {
+        const group = byListing.get(row.listingKey) ?? [];
+        group.push(row);
+        byListing.set(row.listingKey, group);
+      }
+
+      const listingKeys = [...byListing.keys()];
+
+      // Look up listingId for each listingKey (needed for API filter)
+      const propRows = await db
+        .select({ listingKey: properties.listingKey, listingId: properties.listingId })
+        .from(properties)
+        .where(inArray(properties.listingKey, listingKeys));
+
+      const listingIdMap = new Map(propRows.map((r) => [r.listingKey, r.listingId]));
+
+      // Fetch fresh records in batches to respect rate limits
+      const BATCH_SIZE = 10;
+      const listingKeyBatches: string[][] = [];
+      for (let i = 0; i < listingKeys.length; i += BATCH_SIZE) {
+        listingKeyBatches.push(listingKeys.slice(i, i + BATCH_SIZE));
+      }
+
+      for (const batch of listingKeyBatches) {
+        await Promise.all(
+          batch.map(async (listingKey) => {
+            const listingId = listingIdMap.get(listingKey);
+            if (!listingId) {
+              logger.warn({ listingKey }, 'Media recovery: no listingId found — marking media failed');
+              const rows = byListing.get(listingKey) ?? [];
+              for (const row of rows) {
+                await db.update(media).set({ status: 'failed', updatedAt: new Date() }).where(eq(media.mediaKey, row.mediaKey));
+                stillFailed++;
+              }
+              return;
+            }
+
+            // Fetch fresh Property record with expanded Media
+            const apiUrl =
+              `${env.MLSGRID_API_BASE_URL}/Property` +
+              `?$filter=${encodeURIComponent(`OriginatingSystemName eq '${env.MLSGRID_ORIGINATING_SYSTEM}' and ListingId eq '${listingId}'`)}` +
+              `&$expand=Media&$top=1`;
+
+            let freshMediaMap: Map<string, string> | null = null;
+            try {
+              // fetchPage honours waitForApiSlot() internally
+              const page = await fetchPage(apiUrl, this.currentRunId ?? 0);
+              if (page.value.length > 0) {
+                const record = page.value[0] as Record<string, unknown>;
+                const mediaArray = record.Media as Array<Record<string, unknown>> | undefined;
+                if (mediaArray) {
+                  freshMediaMap = new Map(
+                    mediaArray
+                      .filter((m) => m.MediaKey && m.MediaURL)
+                      .map((m) => [m.MediaKey as string, m.MediaURL as string]),
+                  );
+                }
+              }
+            } catch (err) {
+              logger.warn({ listingKey, listingId, err }, 'Media recovery: failed to fetch fresh Property record');
+            }
+
+            const rows = byListing.get(listingKey) ?? [];
+            for (const row of rows) {
+              const freshUrl = freshMediaMap?.get(row.mediaKey) ?? null;
+              if (!freshUrl) {
+                logger.debug({ mediaKey: row.mediaKey, listingKey }, 'Media recovery: no fresh URL found — marking failed');
+                await db.update(media).set({ status: 'failed', updatedAt: new Date() }).where(eq(media.mediaKey, row.mediaKey));
+                stillFailed++;
+                continue;
+              }
+              // Update stored URL so future runs can use it
+              await db.update(media).set({ mediaUrlSource: freshUrl, updatedAt: new Date() }).where(eq(media.mediaKey, row.mediaKey));
+              const ok = await this.recoverOne(row, freshUrl);
+              if (ok) recovered++; else stillFailed++;
+            }
+          }),
+        );
+      }
+    }
+
+    logger.info(
+      { recovered, stillFailed, total: failedRows.length },
+      'Media recovery: complete',
+    );
+  }
+
+  /**
+   * Attempt to download and upload a single media item during recovery.
+   * Returns true on success, false on failure.
+   */
+  private async recoverOne(
+    row: { mediaKey: string; listingKey: string; resourceType: string },
+    mediaUrl: string,
+  ): Promise<boolean> {
+    const db = getDb();
+    const logger = getLogger();
+
+    try {
+      // downloadMedia() honours waitForMediaSlot() and recordMediaDownload() internally
+      const result = await downloadMedia(mediaUrl);
+      const r2ObjectKey = buildR2ObjectKey(row.resourceType, row.listingKey, row.mediaKey, result.contentType);
+      const publicUrl = buildPublicUrl(r2ObjectKey);
+
+      await uploadToR2(r2ObjectKey, result.buffer, result.contentType);
+
+      await db
+        .update(media)
+        .set({
+          status: 'complete',
+          r2ObjectKey,
+          publicUrl,
+          mediaUrlSource: mediaUrl,
+          fileSizeBytes: result.bytes,
+          contentType: result.contentType,
+          retryCount: 0,
+          updatedAt: new Date(),
+        })
+        .where(eq(media.mediaKey, row.mediaKey));
+
+      this.metrics.totalDownloaded++;
+      this.metrics.totalBytes += result.bytes;
+
+      logger.debug({ mediaKey: row.mediaKey, bytes: result.bytes }, 'Media recovery: downloaded successfully');
+      return true;
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      logger.warn({ mediaKey: row.mediaKey, err: errorMsg }, 'Media recovery: download failed');
+      await db
+        .update(media)
+        .set({ status: 'failed', updatedAt: new Date() })
+        .where(eq(media.mediaKey, row.mediaKey));
+      this.metrics.totalFailed++;
+      return false;
+    }
   }
 
   setRunId(runId: number): void {
@@ -321,6 +534,16 @@ export class MediaDownloader {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Parse the Unix expiry timestamp (seconds) from an MLS Grid media URL.
+ * URL format: https://media.mlsgrid.com/token=...&expires=1771798719&id=...
+ * Returns null if the URL doesn't contain an `expires` param.
+ */
+function parseUrlExpiry(url: string): number | null {
+  const match = url.match(/[?&]expires=(\d+)/);
+  return match ? parseInt(match[1], 10) : null;
 }
 
 // Singleton
