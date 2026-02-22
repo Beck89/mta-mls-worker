@@ -25,11 +25,57 @@ export class MediaDownloader {
   private rateLimitPauseUntil = 0; // Timestamp when 429 pause expires
   private currentPauseMs = INITIAL_RATE_LIMIT_PAUSE_MS; // Progressive backoff
 
+  // Session metrics for tuning
+  private metrics = {
+    totalDownloaded: 0,
+    totalBytes: 0,
+    totalFailed: 0,
+    total429s: 0,
+    sessionStartedAt: 0,
+    lastStatsLogAt: 0,
+  };
+
   async start(): Promise<void> {
     this.running = true;
+    this.metrics.sessionStartedAt = Date.now();
+    this.metrics.lastStatsLogAt = Date.now();
     const logger = getLogger();
     logger.info('Media download loop started');
     this.loop();
+    this.statsLoop(); // Periodic stats logging
+  }
+
+  /**
+   * Log media download stats every 60 seconds for tuning.
+   */
+  private async statsLoop(): Promise<void> {
+    const logger = getLogger();
+    while (this.running) {
+      await sleep(60_000); // Every 60 seconds
+      if (!this.running) break;
+
+      const elapsed = (Date.now() - this.metrics.sessionStartedAt) / 1000;
+      const elapsedMin = Math.round(elapsed / 60);
+      const avgBytesPerSec = elapsed > 0 ? Math.round(this.metrics.totalBytes / elapsed) : 0;
+      const avgDownloadsPerMin = elapsed > 60 ? Math.round(this.metrics.totalDownloaded / (elapsed / 60)) : this.metrics.totalDownloaded;
+
+      logger.info(
+        {
+          elapsedMinutes: elapsedMin,
+          totalDownloaded: this.metrics.totalDownloaded,
+          totalFailed: this.metrics.totalFailed,
+          total429s: this.metrics.total429s,
+          totalBytesMB: Math.round(this.metrics.totalBytes / 1024 / 1024),
+          avgBytesPerSec,
+          avgDownloadsPerMin,
+          activeDownloads: this.activeDownloads,
+          concurrencyLimit: getEnv().WORKER_MEDIA_CONCURRENCY,
+          isPaused: Date.now() < this.rateLimitPauseUntil,
+          currentPauseMs: this.currentPauseMs,
+        },
+        'Media download stats',
+      );
+    }
   }
 
   stop(): void {
@@ -167,6 +213,9 @@ export class MediaDownloader {
       status = 'success';
       // Reset progressive backoff on success
       this.currentPauseMs = INITIAL_RATE_LIMIT_PAUSE_MS;
+      // Track metrics
+      this.metrics.totalDownloaded++;
+      this.metrics.totalBytes += fileSizeBytes;
 
       logger.debug(
         {
@@ -184,6 +233,7 @@ export class MediaDownloader {
 
       if (is429) {
         // 429 from CDN — pause ALL media downloads with progressive backoff
+        this.metrics.total429s++;
         this.rateLimitPauseUntil = Date.now() + this.currentPauseMs;
         logger.warn(
           { mediaKey: row.mediaKey, pauseMs: this.currentPauseMs },
@@ -200,6 +250,7 @@ export class MediaDownloader {
           .where(eq(media.mediaKey, row.mediaKey));
       } else if (newRetryCount >= MAX_RETRIES) {
         // Max retries exceeded — mark as failed
+        this.metrics.totalFailed++;
         await db
           .update(media)
           .set({
