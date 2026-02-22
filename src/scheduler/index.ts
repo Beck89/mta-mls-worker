@@ -198,14 +198,14 @@ export function createScheduler() {
 
         // Load recent API request timestamps
         const recentRequests = await db
-          .select({ requestedAt: sql<Date>`requested_at` })
+          .select({ requestedAt: sql<string>`requested_at` })
           .from(sql`replication_requests`)
           .where(sql`requested_at > ${oneDayAgo}`);
 
         // Load recent media download bytes
         const recentMedia = await db
           .select({
-            downloadedAt: sql<Date>`downloaded_at`,
+            downloadedAt: sql<string>`downloaded_at`,
             bytes: sql<number>`file_size_bytes`,
           })
           .from(sql`media_downloads`)
@@ -213,10 +213,10 @@ export function createScheduler() {
 
         const rateLimiter = createRateLimiter();
         rateLimiter.initializeFromHistory(
-          recentRequests.map((r) => r.requestedAt),
+          recentRequests.map((r) => new Date(r.requestedAt)),
           recentMedia
             .filter((r) => r.bytes != null)
-            .map((r) => ({ timestamp: r.downloadedAt, bytes: r.bytes })),
+            .map((r) => ({ timestamp: new Date(r.downloadedAt), bytes: r.bytes })),
         );
       } catch (err) {
         logger.warn({ err }, 'Failed to initialize rate limiter from history (starting fresh)');

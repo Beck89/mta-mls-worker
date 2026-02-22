@@ -51,7 +51,7 @@ export class RateLimiter {
       .filter((e) => e.timestamp > dayAgo);
 
     this.mediaDownloads = mediaDownloadEntries
-      .map((e) => ({ timestamp: e.timestamp.getTime(), bytes: e.bytes }))
+      .map((e) => ({ timestamp: e.timestamp.getTime(), bytes: Number(e.bytes) }))
       .filter((e) => e.timestamp > now - ONE_HOUR);
 
     const logger = getLogger();
@@ -120,7 +120,7 @@ export class RateLimiter {
 
     const lastHourBytes = this.mediaDownloads
       .filter((e) => e.timestamp > now - ONE_HOUR)
-      .reduce((sum, e) => sum + (e.bytes ?? 0), 0);
+      .reduce((sum, e) => sum + Number(e.bytes ?? 0), 0);
 
     if (lastHourBytes >= LIMITS.media.bytesPerHour.hard) {
       return ONE_HOUR; // Wait and recheck
@@ -137,7 +137,7 @@ export class RateLimiter {
    * Record a media download.
    */
   recordMediaDownload(bytes: number): void {
-    this.mediaDownloads.push({ timestamp: Date.now(), bytes });
+    this.mediaDownloads.push({ timestamp: Date.now(), bytes: Number(bytes) });
   }
 
   /**
@@ -180,7 +180,7 @@ export class RateLimiter {
     const apiLastDay = this.apiRequests.filter((e) => e.timestamp > now - ONE_DAY).length;
     const mediaLastHourBytes = this.mediaDownloads
       .filter((e) => e.timestamp > now - ONE_HOUR)
-      .reduce((sum, e) => sum + (e.bytes ?? 0), 0);
+      .reduce((sum, e) => sum + Number(e.bytes ?? 0), 0);
 
     return {
       api: {

@@ -6,15 +6,14 @@ import {
   timestamp,
   index,
 } from 'drizzle-orm/pg-core';
-import { properties } from './properties';
 
 export const media = pgTable(
   'media',
   {
     mediaKey: varchar('media_key').primaryKey(),
-    listingKey: varchar('listing_key')
-      .notNull()
-      .references(() => properties.listingKey, { onDelete: 'cascade' }),
+    // Parent key: listing_key for Property media, member_key for Member, office_key for Office
+    // No FK constraint — media spans multiple resource types
+    listingKey: varchar('listing_key').notNull(),
     resourceType: varchar('resource_type').notNull(), // 'Property', 'Member', 'Office'
     mediaUrlSource: varchar('media_url_source'), // original MLS Grid URL (download reference only)
     r2ObjectKey: varchar('r2_object_key').notNull(),

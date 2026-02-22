@@ -2,23 +2,28 @@ import { eq } from 'drizzle-orm';
 import { getDb } from '../db/connection.js';
 import { media } from '../db/schema/media.js';
 import { mediaDownloads } from '../db/schema/monitoring.js';
-import { downloadMedia } from '../api/mlsgrid-client.js';
+import { downloadMedia, MlsGridApiError } from '../api/mlsgrid-client.js';
 import { uploadToR2, buildR2ObjectKey, buildPublicUrl } from '../storage/r2-client.js';
 import { getLogger } from '../lib/logger.js';
 import { getEnv } from '../config/env.js';
 
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 5; // Increased from 3 for 429 resilience
 const BACKOFF_BASE_MS = 2_000;
+const STAGGER_DELAY_MS = 200; // Delay between starting concurrent downloads
+const INITIAL_RATE_LIMIT_PAUSE_MS = 5 * 60_000; // 5 minute pause when 429 detected
+const MAX_RATE_LIMIT_PAUSE_MS = 15 * 60_000; // Max 15 minute pause
 
 /**
  * Media download loop — runs continuously alongside record processing.
  * Polls for media rows with status = 'pending_download' and processes them
- * with controlled concurrency.
+ * with controlled concurrency and staggered starts.
  */
 export class MediaDownloader {
   private running = false;
   private activeDownloads = 0;
   private currentRunId: number | null = null;
+  private rateLimitPauseUntil = 0; // Timestamp when 429 pause expires
+  private currentPauseMs = INITIAL_RATE_LIMIT_PAUSE_MS; // Progressive backoff
 
   async start(): Promise<void> {
     this.running = true;
@@ -43,8 +48,17 @@ export class MediaDownloader {
 
     while (this.running) {
       try {
+        // Check if we're in a 429 pause
+        if (Date.now() < this.rateLimitPauseUntil) {
+          const remaining = Math.ceil((this.rateLimitPauseUntil - Date.now()) / 1000);
+          logger.info({ remainingSeconds: remaining }, 'Media downloads paused (429 backoff)');
+          await sleep(10_000); // Check every 10s
+          continue;
+        }
+
         // Poll for pending downloads
         const db = getDb();
+        const availableSlots = Math.max(1, concurrency - this.activeDownloads);
         const pending = await db
           .select({
             mediaKey: media.mediaKey,
@@ -55,17 +69,34 @@ export class MediaDownloader {
           })
           .from(media)
           .where(eq(media.status, 'pending_download'))
-          .limit(concurrency - this.activeDownloads);
+          .limit(availableSlots);
 
         if (pending.length === 0) {
           // No work — sleep briefly and check again
-          await sleep(2_000);
+          await sleep(5_000);
           continue;
         }
 
-        // Process downloads concurrently
-        const promises = pending.map((row) => this.downloadOne(row));
-        await Promise.allSettled(promises);
+        // Process downloads with staggered starts to avoid burst
+        for (const row of pending) {
+          if (!this.running || Date.now() < this.rateLimitPauseUntil) break;
+
+          // Don't exceed concurrency
+          while (this.activeDownloads >= concurrency && this.running) {
+            await sleep(500);
+          }
+
+          // Fire off download (don't await — runs concurrently)
+          this.downloadOne(row);
+
+          // Stagger: brief delay before starting next download
+          await sleep(STAGGER_DELAY_MS);
+        }
+
+        // Wait for current batch to finish before polling again
+        while (this.activeDownloads > 0 && this.running) {
+          await sleep(1_000);
+        }
       } catch (err) {
         logger.error({ err }, 'Media download loop error');
         await sleep(5_000);
@@ -134,6 +165,8 @@ export class MediaDownloader {
         .where(eq(media.mediaKey, row.mediaKey));
 
       status = 'success';
+      // Reset progressive backoff on success
+      this.currentPauseMs = INITIAL_RATE_LIMIT_PAUSE_MS;
 
       logger.debug(
         {
@@ -146,9 +179,26 @@ export class MediaDownloader {
       );
     } catch (err) {
       errorMessage = err instanceof Error ? err.message : String(err);
+      const is429 = err instanceof MlsGridApiError && err.statusCode === 429;
       const newRetryCount = row.retryCount + 1;
 
-      if (newRetryCount >= MAX_RETRIES) {
+      if (is429) {
+        // 429 from CDN — pause ALL media downloads with progressive backoff
+        this.rateLimitPauseUntil = Date.now() + this.currentPauseMs;
+        logger.warn(
+          { mediaKey: row.mediaKey, pauseMs: this.currentPauseMs },
+          'Media CDN rate limit (429) — pausing all media downloads',
+        );
+        // Double the pause for next 429, up to max
+        this.currentPauseMs = Math.min(this.currentPauseMs * 2, MAX_RATE_LIMIT_PAUSE_MS);
+
+        // Don't increment retry count for 429 — it's not a permanent failure
+        // Just leave it as pending_download for retry after pause
+        await db
+          .update(media)
+          .set({ updatedAt: new Date() })
+          .where(eq(media.mediaKey, row.mediaKey));
+      } else if (newRetryCount >= MAX_RETRIES) {
         // Max retries exceeded — mark as failed
         await db
           .update(media)
