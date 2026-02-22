@@ -1,5 +1,5 @@
 import { pgTable, varchar, integer, numeric } from 'drizzle-orm/pg-core';
-import { properties } from './properties';
+import { properties } from './properties.js';
 
 export const unitTypes = pgTable('unit_types', {
   unitTypeKey: varchar('unit_type_key').primaryKey(),

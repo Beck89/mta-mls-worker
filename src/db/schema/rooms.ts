@@ -1,6 +1,6 @@
 import { pgTable, varchar } from 'drizzle-orm/pg-core';
 import { customType } from 'drizzle-orm/pg-core';
-import { properties } from './properties';
+import { properties } from './properties.js';
 
 const textArray = customType<{
   data: string[];
