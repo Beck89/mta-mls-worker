@@ -318,11 +318,11 @@ async function downloadMediaInline(
 
   // Get existing media keys for this listing
   const existingMedia = await db
-    .select({ mediaKey: media.mediaKey, mediaModTs: media.mediaModTs, r2ObjectKey: media.r2ObjectKey })
+    .select({ mediaKey: media.mediaKey, mediaModTs: media.mediaModTs, r2ObjectKey: media.r2ObjectKey, status: media.status })
     .from(media)
     .where(eq(media.listingKey, listingKey));
 
-  const existingMediaMap = new Map(existingMedia.map((m: { mediaKey: string; mediaModTs: Date | null; r2ObjectKey: string }) => [m.mediaKey, m]));
+  const existingMediaMap = new Map(existingMedia.map((m: { mediaKey: string; mediaModTs: Date | null; r2ObjectKey: string; status: string }) => [m.mediaKey, m]));
   const incomingMediaKeys = new Set(incomingMedia.map((m) => m.MediaKey).filter(Boolean));
 
   // Find media to delete (no longer in incoming data)
@@ -347,9 +347,13 @@ async function downloadMediaInline(
     const rawMedia = incomingMedia[i];
     const existingRow = existingMediaMap.get(row.mediaKey);
 
-    // Check if download is needed (new or MediaModificationTimestamp changed)
+    // Check if download is needed:
+    // - New media (no existing row)
+    // - MediaModificationTimestamp changed
+    // - Previously expired/failed/pending (needs fresh URL download)
     const needsDownload =
       !existingRow ||
+      existingRow.status !== 'complete' ||
       (row.mediaModTs &&
         existingRow.mediaModTs?.toISOString() !== row.mediaModTs.toISOString());
 

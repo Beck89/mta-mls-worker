@@ -229,9 +229,23 @@ export class MediaDownloader {
     } catch (err) {
       errorMessage = err instanceof Error ? err.message : String(err);
       const is429 = err instanceof MlsGridApiError && err.statusCode === 429;
+      const isExpired = err instanceof MlsGridApiError && (err.statusCode === 400 || err.statusCode === 403);
       const newRetryCount = row.retryCount + 1;
 
-      if (is429) {
+      if (isExpired) {
+        // 400/403 = expired URL token. Mark as expired — will get fresh URL
+        // when parent listing is re-processed in next replication cycle.
+        await db
+          .update(media)
+          .set({ status: 'expired', updatedAt: new Date() })
+          .where(eq(media.mediaKey, row.mediaKey));
+
+        logger.debug(
+          { mediaKey: row.mediaKey },
+          'Media URL expired (400/403) — will get fresh URL on next replication',
+        );
+        return; // Don't retry — URL is dead
+      } else if (is429) {
         // 429 from CDN — pause ALL media downloads with progressive backoff
         this.metrics.total429s++;
         this.rateLimitPauseUntil = Date.now() + this.currentPauseMs;
