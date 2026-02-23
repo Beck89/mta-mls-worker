@@ -247,6 +247,23 @@ export function createScheduler() {
       runResourceLoop('OpenHouse');
       runResourceLoop('Lookup');
 
+      // Schedule periodic media recovery (every 30 minutes) to pick up
+      // expired media that accumulated since the last recovery pass.
+      const MEDIA_RECOVERY_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+      (async () => {
+        while (isRunning) {
+          await sleep(MEDIA_RECOVERY_INTERVAL_MS);
+          if (isRunning) {
+            try {
+              logger.info('Periodic media recovery: starting');
+              await downloader.recoverFailedMedia();
+            } catch (err) {
+              logger.error({ err }, 'Periodic media recovery failed');
+            }
+          }
+        }
+      })();
+
       // Schedule daily cleanup (runs alongside Lookup cadence)
       (async () => {
         while (isRunning) {

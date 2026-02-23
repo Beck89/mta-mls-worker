@@ -319,11 +319,18 @@ async function downloadMediaInline(
 
   // Get existing media keys for this listing
   const existingMedia = await db
-    .select({ mediaKey: media.mediaKey, mediaModTs: media.mediaModTs, r2ObjectKey: media.r2ObjectKey, status: media.status })
+    .select({
+      mediaKey: media.mediaKey,
+      mediaModTs: media.mediaModTs,
+      r2ObjectKey: media.r2ObjectKey,
+      publicUrl: media.publicUrl,
+      fileSizeBytes: media.fileSizeBytes,
+      status: media.status,
+    })
     .from(media)
     .where(eq(media.listingKey, listingKey));
 
-  const existingMediaMap = new Map(existingMedia.map((m: { mediaKey: string; mediaModTs: Date | null; r2ObjectKey: string; status: string }) => [m.mediaKey, m]));
+  const existingMediaMap = new Map(existingMedia.map((m) => [m.mediaKey, m]));
   const incomingMediaKeys = new Set(incomingMedia.map((m) => m.MediaKey).filter(Boolean));
 
   // Find media to delete (no longer in incoming data)
@@ -375,6 +382,37 @@ async function downloadMediaInline(
       continue;
     }
 
+    // Fast-path: if the row already has a valid R2 object key and public URL
+    // (and a non-null file size proving the download completed), the image was
+    // previously downloaded successfully. Even if the MLS Grid URL is now expired,
+    // we don't need to re-download — just restore status to complete and update
+    // metadata. This prevents replication from re-marking 'expired' rows that are
+    // already safely stored in R2.
+    if (
+      existingRow?.r2ObjectKey &&
+      existingRow.r2ObjectKey.length > 0 &&
+      existingRow.publicUrl &&
+      existingRow.fileSizeBytes != null &&
+      existingRow.fileSizeBytes > 0
+    ) {
+      await db
+        .update(media)
+        .set({
+          status: 'complete',
+          mediaOrder: row.mediaOrder,
+          mediaCategory: row.mediaCategory,
+          mediaModTs: row.mediaModTs,
+          updatedAt: new Date(),
+        })
+        .where(eq(media.mediaKey, row.mediaKey));
+      logger.debug(
+        { mediaKey: row.mediaKey, listingKey },
+        'Media already in R2 — restoring complete status without re-download',
+      );
+      skipped++;
+      continue;
+    }
+
     const mediaUrl = rawMedia.MediaURL;
     if (!mediaUrl) {
       // No URL — insert as failed
@@ -393,6 +431,16 @@ async function downloadMediaInline(
     // recoverFailedMedia() can fetch a fresh URL on next startup — don't
     // waste a download attempt or permanently mark it failed.
     if (isMediaUrlExpired(mediaUrl)) {
+      // If the record is already marked expired, don't re-upsert — avoid
+      // unnecessary writes and potential data loss on the conflict path.
+      if (existingRow?.status === 'expired') {
+        logger.debug(
+          { mediaKey: row.mediaKey, listingKey },
+          'Media URL still expired — already marked, skipping',
+        );
+        skipped++;
+        continue;
+      }
       await db
         .insert(media)
         .values({ ...row, status: 'expired', mediaUrlSource: mediaUrl })
