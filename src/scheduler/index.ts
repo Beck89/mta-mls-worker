@@ -193,8 +193,9 @@ export function createScheduler() {
       // This is a best-effort initialization — empty counters are safe
       try {
         const db = getDb();
-        const oneHourAgo = new Date(Date.now() - 3_600_000);
         const oneDayAgo = new Date(Date.now() - 86_400_000);
+        // Use the fixed clock-hour boundary to match MLS Grid's billing window
+        const startOfCurrentHour = new Date(Date.now() - (Date.now() % 3_600_000));
 
         // Load recent API request timestamps
         const recentRequests = await db
@@ -202,14 +203,14 @@ export function createScheduler() {
           .from(sql`replication_requests`)
           .where(sql`requested_at > ${oneDayAgo}`);
 
-        // Load recent media download bytes
+        // Load media download bytes from the current clock hour only
         const recentMedia = await db
           .select({
             downloadedAt: sql<string>`downloaded_at`,
             bytes: sql<number>`file_size_bytes`,
           })
           .from(sql`media_downloads`)
-          .where(sql`downloaded_at > ${oneHourAgo} AND status = 'success'`);
+          .where(sql`downloaded_at >= ${startOfCurrentHour} AND status = 'success'`);
 
         const rateLimiter = createRateLimiter();
         rateLimiter.initializeFromHistory(
