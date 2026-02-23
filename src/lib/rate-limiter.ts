@@ -1,31 +1,38 @@
+import { getEnv } from '../config/env.js';
 import { getLogger } from './logger.js';
 
 /**
- * Two-dimension sliding window rate limiter.
+ * Two-dimension rate limiter.
  *
- * Dimension 1: API request counts (api.mlsgrid.com only)
+ * Dimension 1: API request counts (api.mlsgrid.com only) — sliding window
  *   - 2 requests per second (soft cap 1.5)
  *   - 7,200 requests per hour (soft cap 6,000)
  *   - 40,000 requests per 24 hours (soft cap 35,000)
  *
- * Dimension 2: Media download bytes (CDN, not API endpoint)
- *   - 4 GB per hour (soft cap 3.5 GB)
+ * Dimension 2: Media download bytes (CDN, not API endpoint) — fixed clock-hour window
+ *   Resets at the top of every UTC hour, matching MLS Grid's own billing window.
+ *   Caps are configurable via WORKER_MEDIA_BANDWIDTH_HARD_CAP_GB / WORKER_MEDIA_BANDWIDTH_SOFT_CAP_GB.
  */
 
 const ONE_SECOND = 1_000;
 const ONE_HOUR = 3_600_000;
 const ONE_DAY = 86_400_000;
 
-const LIMITS = {
-  api: {
-    perSecond: { hard: 2, soft: 1.5 },
-    perHour: { hard: 7_200, soft: 6_000 },
-    perDay: { hard: 40_000, soft: 35_000 },
-  },
-  media: {
-    bytesPerHour: { hard: 4 * 1024 * 1024 * 1024, soft: 3.5 * 1024 * 1024 * 1024 }, // 4 GB / 3.5 GB
-  },
+const GB = 1024 * 1024 * 1024;
+
+const API_LIMITS = {
+  perSecond: { hard: 2, soft: 1.5 },
+  perHour: { hard: 7_200, soft: 6_000 },
+  perDay: { hard: 40_000, soft: 35_000 },
 } as const;
+
+function getMediaLimits() {
+  const env = getEnv();
+  return {
+    hard: env.WORKER_MEDIA_BANDWIDTH_HARD_CAP_GB * GB,
+    soft: env.WORKER_MEDIA_BANDWIDTH_SOFT_CAP_GB * GB,
+  };
+}
 
 interface TimestampedEntry {
   timestamp: number;
@@ -45,14 +52,16 @@ export class RateLimiter {
   ): void {
     const now = Date.now();
     const dayAgo = now - ONE_DAY;
+    const startOfHour = now - (now % ONE_HOUR);
 
     this.apiRequests = apiRequestTimestamps
       .map((ts) => ({ timestamp: ts.getTime() }))
       .filter((e) => e.timestamp > dayAgo);
 
+    // Only load entries from the current clock hour — matches MLS Grid's fixed reset window
     this.mediaDownloads = mediaDownloadEntries
       .map((e) => ({ timestamp: e.timestamp.getTime(), bytes: Number(e.bytes) }))
-      .filter((e) => e.timestamp > now - ONE_HOUR);
+      .filter((e) => e.timestamp >= startOfHour);
 
     const logger = getLogger();
     logger.info(
@@ -73,31 +82,31 @@ export class RateLimiter {
 
     // Check 1-second window
     const lastSecond = this.apiRequests.filter((e) => e.timestamp > now - ONE_SECOND);
-    if (lastSecond.length >= LIMITS.api.perSecond.hard) {
+    if (lastSecond.length >= API_LIMITS.perSecond.hard) {
       const oldestInWindow = Math.min(...lastSecond.map((e) => e.timestamp));
       return oldestInWindow + ONE_SECOND - now + 50; // +50ms buffer
     }
 
     // Check hourly window
     const lastHour = this.apiRequests.filter((e) => e.timestamp > now - ONE_HOUR);
-    if (lastHour.length >= LIMITS.api.perHour.hard) {
+    if (lastHour.length >= API_LIMITS.perHour.hard) {
       return ONE_HOUR; // Wait a full hour (will be rechecked)
     }
 
     // Check daily window
     const lastDay = this.apiRequests.filter((e) => e.timestamp > now - ONE_DAY);
-    if (lastDay.length >= LIMITS.api.perDay.hard) {
+    if (lastDay.length >= API_LIMITS.perDay.hard) {
       return ONE_HOUR; // Wait and recheck
     }
 
     // Soft cap warnings
-    if (lastSecond.length >= LIMITS.api.perSecond.soft) {
+    if (lastSecond.length >= API_LIMITS.perSecond.soft) {
       return 200; // Brief pause at soft cap
     }
-    if (lastHour.length >= LIMITS.api.perHour.soft) {
+    if (lastHour.length >= API_LIMITS.perHour.soft) {
       return 2_000; // 2s pause approaching hourly limit
     }
-    if (lastDay.length >= LIMITS.api.perDay.soft) {
+    if (lastDay.length >= API_LIMITS.perDay.soft) {
       return 5_000; // 5s pause approaching daily limit
     }
 
@@ -113,20 +122,24 @@ export class RateLimiter {
 
   /**
    * Check if a media download can proceed. Returns wait time in ms (0 = proceed).
+   * Uses a fixed clock-hour window (resets at :00 each hour) to match MLS Grid's billing window.
    */
   checkMediaDownload(): number {
     this.pruneMediaDownloads();
     const now = Date.now();
+    const startOfHour = now - (now % ONE_HOUR);
+    const mediaLimits = getMediaLimits();
 
-    const lastHourBytes = this.mediaDownloads
-      .filter((e) => e.timestamp > now - ONE_HOUR)
+    const currentHourBytes = this.mediaDownloads
+      .filter((e) => e.timestamp >= startOfHour)
       .reduce((sum, e) => sum + Number(e.bytes ?? 0), 0);
 
-    if (lastHourBytes >= LIMITS.media.bytesPerHour.hard) {
-      return ONE_HOUR; // Wait and recheck
+    if (currentHourBytes >= mediaLimits.hard) {
+      // Wait until the top of the next hour
+      return startOfHour + ONE_HOUR - now + 100; // +100ms buffer past the reset
     }
 
-    if (lastHourBytes >= LIMITS.media.bytesPerHour.soft) {
+    if (currentHourBytes >= mediaLimits.soft) {
       return 10_000; // 10s pause approaching bandwidth limit
     }
 
@@ -169,30 +182,34 @@ export class RateLimiter {
 
   /**
    * Get current usage stats for health check reporting.
+   * Media bytes use the fixed clock-hour window to match MLS Grid's billing window.
    */
   getUsageStats() {
     this.pruneApiRequests();
     this.pruneMediaDownloads();
     const now = Date.now();
+    const startOfHour = now - (now % ONE_HOUR);
+    const mediaLimits = getMediaLimits();
 
     const apiLastSecond = this.apiRequests.filter((e) => e.timestamp > now - ONE_SECOND).length;
     const apiLastHour = this.apiRequests.filter((e) => e.timestamp > now - ONE_HOUR).length;
     const apiLastDay = this.apiRequests.filter((e) => e.timestamp > now - ONE_DAY).length;
-    const mediaLastHourBytes = this.mediaDownloads
-      .filter((e) => e.timestamp > now - ONE_HOUR)
+    const mediaCurrentHourBytes = this.mediaDownloads
+      .filter((e) => e.timestamp >= startOfHour)
       .reduce((sum, e) => sum + Number(e.bytes ?? 0), 0);
 
     return {
       api: {
-        lastSecond: { current: apiLastSecond, limit: LIMITS.api.perSecond.hard },
-        lastHour: { current: apiLastHour, limit: LIMITS.api.perHour.hard },
-        lastDay: { current: apiLastDay, limit: LIMITS.api.perDay.hard },
+        lastSecond: { current: apiLastSecond, limit: API_LIMITS.perSecond.hard },
+        lastHour: { current: apiLastHour, limit: API_LIMITS.perHour.hard },
+        lastDay: { current: apiLastDay, limit: API_LIMITS.perDay.hard },
       },
       media: {
-        lastHourBytes: {
-          current: mediaLastHourBytes,
-          limit: LIMITS.media.bytesPerHour.hard,
-          percentUsed: Math.round((mediaLastHourBytes / LIMITS.media.bytesPerHour.hard) * 100),
+        currentHourBytes: {
+          current: mediaCurrentHourBytes,
+          limit: mediaLimits.hard,
+          softLimit: mediaLimits.soft,
+          percentUsed: Math.round((mediaCurrentHourBytes / mediaLimits.hard) * 100),
         },
       },
     };
@@ -204,8 +221,10 @@ export class RateLimiter {
   }
 
   private pruneMediaDownloads(): void {
-    const cutoff = Date.now() - ONE_HOUR;
-    this.mediaDownloads = this.mediaDownloads.filter((e) => e.timestamp > cutoff);
+    // Keep only entries from the current clock hour — older ones can never affect the limit again
+    const now = Date.now();
+    const startOfHour = now - (now % ONE_HOUR);
+    this.mediaDownloads = this.mediaDownloads.filter((e) => e.timestamp >= startOfHour);
   }
 }
 

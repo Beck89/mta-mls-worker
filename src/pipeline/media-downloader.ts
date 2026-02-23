@@ -257,13 +257,25 @@ export class MediaDownloader {
     const db = getDb();
     const logger = getLogger();
 
+    const downloadStart = Date.now();
+    let downloadTimeMs = 0;
+    let r2UploadTimeMs = 0;
+    let fileSizeBytes = 0;
+    let status: 'success' | 'failed' | 'skipped' = 'failed';
+    let errorMessage: string | null = null;
+
     try {
       // downloadMedia() honours waitForMediaSlot() and recordMediaDownload() internally
       const result = await downloadMedia(mediaUrl);
+      downloadTimeMs = Date.now() - downloadStart;
+      fileSizeBytes = result.bytes;
+
       const r2ObjectKey = buildR2ObjectKey(row.resourceType, row.listingKey, row.mediaKey, result.contentType);
       const publicUrl = buildPublicUrl(r2ObjectKey);
 
+      const uploadStart = Date.now();
       await uploadToR2(r2ObjectKey, result.buffer, result.contentType);
+      r2UploadTimeMs = Date.now() - uploadStart;
 
       await db
         .update(media)
@@ -279,20 +291,38 @@ export class MediaDownloader {
         })
         .where(eq(media.mediaKey, row.mediaKey));
 
+      status = 'success';
       this.metrics.totalDownloaded++;
       this.metrics.totalBytes += result.bytes;
 
       logger.debug({ mediaKey: row.mediaKey, bytes: result.bytes }, 'Media recovery: downloaded successfully');
       return true;
     } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      logger.warn({ mediaKey: row.mediaKey, err: errorMsg }, 'Media recovery: download failed');
+      errorMessage = err instanceof Error ? err.message : String(err);
+      logger.warn({ mediaKey: row.mediaKey, err: errorMessage }, 'Media recovery: download failed');
       await db
         .update(media)
         .set({ status: 'failed', updatedAt: new Date() })
         .where(eq(media.mediaKey, row.mediaKey));
       this.metrics.totalFailed++;
       return false;
+    } finally {
+      // Log to media_downloads audit table (same as downloadOne)
+      try {
+        await db.insert(mediaDownloads).values({
+          runId: this.currentRunId,
+          mediaKey: row.mediaKey,
+          listingKey: row.listingKey,
+          fileSizeBytes: fileSizeBytes || null,
+          downloadTimeMs: downloadTimeMs || null,
+          r2UploadTimeMs: r2UploadTimeMs || null,
+          status,
+          errorMessage,
+          downloadedAt: new Date(),
+        });
+      } catch (logErr) {
+        logger.warn({ err: logErr }, 'Failed to log media recovery download');
+      }
     }
   }
 
