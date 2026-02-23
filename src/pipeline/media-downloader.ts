@@ -109,6 +109,8 @@ export class MediaDownloader {
         listingKey: media.listingKey,
         resourceType: media.resourceType,
         mediaUrlSource: media.mediaUrlSource,
+        r2ObjectKey: media.r2ObjectKey,
+        publicUrl: media.publicUrl,
       })
       .from(media)
       .where(or(eq(media.status, 'failed'), eq(media.status, 'expired')));
@@ -120,6 +122,31 @@ export class MediaDownloader {
 
     logger.info({ count: failedRows.length }, 'Media recovery: starting failed media re-download');
 
+    // Fast-path: rows that already have an r2_object_key are already in R2 —
+    // just flip them to complete without re-downloading.
+    const alreadyInR2 = failedRows.filter((r) => r.r2ObjectKey && r.publicUrl);
+    const needsDownload = failedRows.filter((r) => !r.r2ObjectKey || !r.publicUrl);
+
+    if (alreadyInR2.length > 0) {
+      logger.info(
+        { count: alreadyInR2.length },
+        'Media recovery: rows already in R2 — marking complete without re-download',
+      );
+      for (const row of alreadyInR2) {
+        await db
+          .update(media)
+          .set({ status: 'complete', updatedAt: new Date() })
+          .where(eq(media.mediaKey, row.mediaKey));
+      }
+    }
+
+    if (needsDownload.length === 0) {
+      logger.info('Media recovery: all rows already in R2 — nothing to download');
+      return;
+    }
+
+    logger.info({ count: needsDownload.length }, 'Media recovery: rows needing download');
+
     const nowSec = Math.floor(Date.now() / 1000);
     const URL_EXPIRY_BUFFER_SEC = 60; // treat URLs expiring within 60s as expired
 
@@ -127,7 +154,7 @@ export class MediaDownloader {
     const stillValid: typeof failedRows = [];
     const needFreshUrl: typeof failedRows = [];
 
-    for (const row of failedRows) {
+    for (const row of needsDownload) {
       if (!row.mediaUrlSource) {
         // No URL at all — can't recover without a fresh API fetch
         needFreshUrl.push(row);
@@ -299,6 +326,24 @@ export class MediaDownloader {
       return true;
     } catch (err) {
       errorMessage = err instanceof Error ? err.message : String(err);
+      const is429 = err instanceof MlsGridApiError && err.statusCode === 429;
+
+      if (is429) {
+        // 429 from CDN during recovery — leave as expired so the next recovery
+        // run can retry it. Don't permanently mark failed.
+        this.metrics.total429s++;
+        logger.warn(
+          { mediaKey: row.mediaKey },
+          'Media recovery: CDN 429 — leaving as expired for next recovery run',
+        );
+        await db
+          .update(media)
+          .set({ status: 'expired', updatedAt: new Date() })
+          .where(eq(media.mediaKey, row.mediaKey));
+        // Don't count as totalFailed — it's a transient rate limit
+        return false;
+      }
+
       logger.warn({ mediaKey: row.mediaKey, err: errorMessage }, 'Media recovery: download failed');
       await db
         .update(media)
