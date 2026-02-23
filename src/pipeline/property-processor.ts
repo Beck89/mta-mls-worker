@@ -553,8 +553,23 @@ async function downloadMediaInline(
         const isExpiredUrl = err instanceof MlsGridApiError && (err.statusCode === 400 || err.statusCode === 403);
 
         if (isExpiredUrl) {
-          // 400/403 = URL token expired mid-download. Mark as expired so
-          // recoverFailedMedia() fetches a fresh URL — don't permanently fail it.
+          // 400/403 = URL token expired mid-download.
+          // If the record already has valid R2 data from a previous download,
+          // keep it as complete — the existing image is still valid.
+          if (
+            existingRow?.publicUrl &&
+            existingRow.fileSizeBytes != null &&
+            existingRow.fileSizeBytes > 0
+          ) {
+            logger.debug(
+              { mediaKey: row.mediaKey, listingKey, statusCode: (err as MlsGridApiError).statusCode },
+              'Media URL expired (400/403) but existing R2 data is valid — keeping complete',
+            );
+            success = true;
+            break;
+          }
+          // No existing R2 data — mark as expired so recoverFailedMedia()
+          // fetches a fresh URL.
           await db
             .insert(media)
             .values({ ...row, status: 'expired', mediaUrlSource: mediaUrl })
