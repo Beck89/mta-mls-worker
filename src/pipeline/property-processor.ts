@@ -15,8 +15,9 @@ import {
 } from '../transform/property-mapper.js';
 import type { MlsGridPropertyRecord, MlsGridMediaRecord } from '../transform/property-mapper.js';
 import { batchDeleteFromR2, uploadToR2, buildR2ObjectKey, buildPublicUrl } from '../storage/r2-client.js';
-import { downloadMedia, MlsGridApiError } from '../api/mlsgrid-client.js';
+import { downloadMedia, fetchPage, MlsGridApiError } from '../api/mlsgrid-client.js';
 import { isMediaUrlExpired } from './media-downloader.js';
+import { getEnv } from '../config/env.js';
 import { getLogger } from '../lib/logger.js';
 import { notifyIfNeeded } from '../alerts/notify.js';
 
@@ -136,7 +137,7 @@ export async function processPropertyRecord(
       existingRecord.photosChangeTs?.toISOString() !== new Date(raw.PhotosChangeTimestamp).toISOString());
 
   if (photosChanged && mediaRecords && mediaRecords.length > 0) {
-    const mediaResult = await downloadMediaInline(listingKey, 'Property', mediaRecords, existingRecord);
+    const mediaResult = await downloadMediaInline(listingKey, raw.ListingId ?? null, 'Property', mediaRecords, existingRecord);
     stats.mediaQueued = mediaResult.downloaded + mediaResult.failed;
   }
 
@@ -307,12 +308,14 @@ async function recordDiffs(
  */
 async function downloadMediaInline(
   listingKey: string,
+  listingId: string | null,
   resourceType: string,
   incomingMedia: MlsGridMediaRecord[],
   _existingRecord: typeof properties.$inferSelect | null,
 ): Promise<{ downloaded: number; failed: number; skipped: number }> {
   const db = getDb();
   const logger = getLogger();
+  const env = getEnv();
   let downloaded = 0;
   let failed = 0;
   let skipped = 0;
@@ -349,6 +352,45 @@ async function downloadMediaInline(
 
   // Process each incoming media record: upsert metadata + download + upload to R2
   const mediaRows = transformMediaRecords(listingKey, resourceType, incomingMedia);
+
+  // Pre-check: if the first media URL is already expired, fetch fresh URLs from
+  // the API before entering the download loop. This handles the case where the
+  // replication page was fetched hours ago and all URLs have since expired.
+  let freshUrlMap: Map<string, string> | null = null;
+  const firstUrl = incomingMedia[0]?.MediaURL;
+  if (firstUrl && isMediaUrlExpired(firstUrl) && listingId) {
+    logger.info(
+      { listingKey, listingId },
+      'Media URLs expired — fetching fresh URLs from API',
+    );
+    try {
+      const apiUrl =
+        `${env.MLSGRID_API_BASE_URL}/Property` +
+        `?$filter=${encodeURIComponent(`OriginatingSystemName eq '${env.MLSGRID_ORIGINATING_SYSTEM}' and ListingId eq '${listingId}'`)}` +
+        `&$expand=Media&$top=1`;
+      const page = await fetchPage(apiUrl, 0);
+      if (page.value.length > 0) {
+        const record = page.value[0] as Record<string, unknown>;
+        const mediaArray = record.Media as Array<Record<string, unknown>> | undefined;
+        if (mediaArray) {
+          freshUrlMap = new Map(
+            mediaArray
+              .filter((m) => m.MediaKey && m.MediaURL)
+              .map((m) => [m.MediaKey as string, m.MediaURL as string]),
+          );
+          logger.info(
+            { listingKey, freshUrls: freshUrlMap.size },
+            'Fetched fresh media URLs',
+          );
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        { listingKey, listingId, err: (err as Error).message },
+        'Failed to fetch fresh media URLs — will mark as expired for recovery',
+      );
+    }
+  }
 
   for (let i = 0; i < mediaRows.length; i++) {
     const row = mediaRows[i];
@@ -413,7 +455,11 @@ async function downloadMediaInline(
       continue;
     }
 
-    const mediaUrl = rawMedia.MediaURL;
+    // Resolve the download URL: prefer fresh URL from API re-fetch, fall back to
+    // the URL from the original replication page.
+    const originalUrl = rawMedia.MediaURL;
+    const mediaUrl = freshUrlMap?.get(row.mediaKey) ?? originalUrl;
+
     if (!mediaUrl) {
       // No URL — insert as failed
       await db
@@ -427,9 +473,8 @@ async function downloadMediaInline(
       continue;
     }
 
-    // Pre-flight: if the URL token is already expired, mark as expired so
-    // recoverFailedMedia() can fetch a fresh URL on next startup — don't
-    // waste a download attempt or permanently mark it failed.
+    // Pre-flight: if the URL token is already expired (even after fresh fetch),
+    // mark as expired so recoverFailedMedia() can retry later.
     if (isMediaUrlExpired(mediaUrl)) {
       // If the record is already marked expired, don't re-upsert — avoid
       // unnecessary writes and potential data loss on the conflict path.
