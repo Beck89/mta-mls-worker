@@ -421,6 +421,20 @@ export class MediaDownloader {
         return;
       }
 
+      // Pre-flight: skip download if URL token is already expired
+      if (isMediaUrlExpired(row.mediaUrlSource)) {
+        status = 'skipped';
+        await db
+          .update(media)
+          .set({ status: 'expired', updatedAt: new Date() })
+          .where(eq(media.mediaKey, row.mediaKey));
+        logger.debug(
+          { mediaKey: row.mediaKey },
+          'Media URL expired before download — marking expired for recovery',
+        );
+        return;
+      }
+
       // Download from MLS Grid MediaURL
       const downloadResult = await downloadMedia(row.mediaUrlSource);
       downloadTimeMs = Date.now() - downloadStart;
@@ -571,9 +585,18 @@ function sleep(ms: number): Promise<void> {
  * URL format: https://media.mlsgrid.com/token=...&expires=1771798719&id=...
  * Returns null if the URL doesn't contain an `expires` param.
  */
-function parseUrlExpiry(url: string): number | null {
+export function parseUrlExpiry(url: string): number | null {
   const match = url.match(/[?&]expires=(\d+)/);
   return match ? parseInt(match[1], 10) : null;
+}
+
+/**
+ * Returns true if the URL's `expires=` timestamp is in the past (or within bufferSec seconds).
+ */
+export function isMediaUrlExpired(url: string, bufferSec = 60): boolean {
+  const expiresAt = parseUrlExpiry(url);
+  if (expiresAt === null) return false; // No expiry param — assume valid
+  return expiresAt <= Math.floor(Date.now() / 1000) + bufferSec;
 }
 
 // Singleton

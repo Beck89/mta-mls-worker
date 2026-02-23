@@ -16,6 +16,7 @@ import {
 import type { MlsGridPropertyRecord, MlsGridMediaRecord } from '../transform/property-mapper.js';
 import { batchDeleteFromR2, uploadToR2, buildR2ObjectKey, buildPublicUrl } from '../storage/r2-client.js';
 import { downloadMedia, MlsGridApiError } from '../api/mlsgrid-client.js';
+import { isMediaUrlExpired } from './media-downloader.js';
 import { getLogger } from '../lib/logger.js';
 import { notifyIfNeeded } from '../alerts/notify.js';
 
@@ -388,6 +389,25 @@ async function downloadMediaInline(
       continue;
     }
 
+    // Pre-flight: if the URL token is already expired, mark as expired so
+    // recoverFailedMedia() can fetch a fresh URL on next startup — don't
+    // waste a download attempt or permanently mark it failed.
+    if (isMediaUrlExpired(mediaUrl)) {
+      await db
+        .insert(media)
+        .values({ ...row, status: 'expired', mediaUrlSource: mediaUrl })
+        .onConflictDoUpdate({
+          target: media.mediaKey,
+          set: { status: 'expired', mediaUrlSource: mediaUrl, updatedAt: new Date() },
+        });
+      logger.debug(
+        { mediaKey: row.mediaKey, listingKey },
+        'Media URL already expired — marking for recovery',
+      );
+      failed++;
+      continue;
+    }
+
     // Download and upload with retry
     let success = false;
     for (let attempt = 0; attempt < MEDIA_MAX_RETRIES; attempt++) {
@@ -440,12 +460,20 @@ async function downloadMediaInline(
         const isExpiredUrl = err instanceof MlsGridApiError && (err.statusCode === 400 || err.statusCode === 403);
 
         if (isExpiredUrl) {
-          // 400/403 = URL token expired. No point retrying — URL is dead.
-          // recoverFailedMedia() on next startup will fetch a fresh URL.
+          // 400/403 = URL token expired mid-download. Mark as expired so
+          // recoverFailedMedia() fetches a fresh URL — don't permanently fail it.
+          await db
+            .insert(media)
+            .values({ ...row, status: 'expired', mediaUrlSource: mediaUrl })
+            .onConflictDoUpdate({
+              target: media.mediaKey,
+              set: { status: 'expired', mediaUrlSource: mediaUrl, updatedAt: new Date() },
+            });
           logger.debug(
             { mediaKey: row.mediaKey, listingKey, statusCode: (err as MlsGridApiError).statusCode },
-            'Media URL expired (400/403) — skipping retries',
+            'Media URL expired (400/403) during download — marking for recovery',
           );
+          success = true; // Prevent the failed-insert block below from overwriting
           break;
         }
         if (is429 && attempt < MEDIA_MAX_RETRIES - 1) {
