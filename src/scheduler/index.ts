@@ -1,4 +1,4 @@
-import { eq, and, lt, isNotNull, sql } from 'drizzle-orm';
+import { eq, and, lt, isNotNull, sql, inArray } from 'drizzle-orm';
 import { getDb } from '../db/connection.js';
 import { properties } from '../db/schema/properties.js';
 import { media } from '../db/schema/media.js';
@@ -97,16 +97,40 @@ export function createScheduler() {
   async function runInitialImport(): Promise<void> {
     logger.info('Starting initial import sequence');
 
-    // Check if initial import is needed by looking for any completed runs
     const db = getDb();
+
+    // Clean up stale 'running' records from previous server restarts
+    const staleRunning = await db
+      .select({ id: replicationRuns.id })
+      .from(replicationRuns)
+      .where(eq(replicationRuns.status, 'running'));
+
+    if (staleRunning.length > 0) {
+      logger.warn(
+        { count: staleRunning.length },
+        'Found stale running records from previous restarts — marking as partial',
+      );
+      for (const run of staleRunning) {
+        await db
+          .update(replicationRuns)
+          .set({
+            status: 'partial',
+            completedAt: new Date(),
+            errorMessage: 'Server restarted before completion',
+          })
+          .where(eq(replicationRuns.id, run.id));
+      }
+    }
+
+    // Check if initial import is needed by looking for any completed or partial runs
     const existingRuns = await db
       .select({ id: replicationRuns.id })
       .from(replicationRuns)
-      .where(eq(replicationRuns.status, 'completed'))
+      .where(inArray(replicationRuns.status, ['completed', 'partial']))
       .limit(1);
 
     if (existingRuns.length > 0) {
-      logger.info('Previous completed runs found — skipping initial import sequence');
+      logger.info('Previous completed/partial runs found — skipping initial import sequence');
       initialImportComplete = true;
       return;
     }

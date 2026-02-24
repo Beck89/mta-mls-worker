@@ -537,8 +537,23 @@ export class MediaDownloader {
       const newRetryCount = row.retryCount + 1;
 
       if (isExpired) {
-        // 400/403 = expired URL token. Mark as expired — will get fresh URL
-        // when parent listing is re-processed in next replication cycle.
+        // 400/403 = expired URL token. Check if the record already has valid
+        // R2 data from a previous download — if so, keep it as complete.
+        const existingMedia = await db
+          .select({ publicUrl: media.publicUrl, fileSizeBytes: media.fileSizeBytes })
+          .from(media)
+          .where(eq(media.mediaKey, row.mediaKey))
+          .limit(1);
+
+        if (existingMedia[0]?.publicUrl && existingMedia[0]?.fileSizeBytes != null && existingMedia[0].fileSizeBytes > 0) {
+          logger.debug(
+            { mediaKey: row.mediaKey },
+            'Media URL expired (400/403) but existing R2 data is valid — keeping complete',
+          );
+          return;
+        }
+
+        // No existing R2 data — mark as expired for recovery.
         await db
           .update(media)
           .set({ status: 'expired', updatedAt: new Date() })

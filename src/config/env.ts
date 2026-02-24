@@ -21,6 +21,7 @@ const envSchema = z.object({
   // Worker Configuration
   WORKER_HEALTH_PORT: z.coerce.number().int().positive().default(3001),
   WORKER_MEDIA_CONCURRENCY: z.coerce.number().int().positive().default(15),
+  WORKER_INLINE_MEDIA_CONCURRENCY: z.coerce.number().int().positive().default(4),
   WORKER_LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
   // Media bandwidth limits (GB per hour). Soft cap triggers a 10s pause; hard cap waits until next hour.
   WORKER_MEDIA_BANDWIDTH_SOFT_CAP_GB: z.coerce.number().positive().default(3.5),

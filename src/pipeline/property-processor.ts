@@ -21,7 +21,6 @@ import { getEnv } from '../config/env.js';
 import { getLogger } from '../lib/logger.js';
 import { notifyIfNeeded } from '../alerts/notify.js';
 
-const MEDIA_DOWNLOAD_STAGGER_MS = 200; // Delay between sequential media downloads
 const MEDIA_MAX_RETRIES = 3;
 
 export interface ProcessingStats {
@@ -392,15 +391,22 @@ async function downloadMediaInline(
     }
   }
 
+  // Phase 1: Quick checks — handle skips, fast-paths, no-URL, expired URL
+  // Collect items that need actual downloading into a separate list.
+  interface DownloadTask {
+    row: typeof mediaRows[0];
+    rawMedia: (typeof incomingMedia)[0];
+    existingRow: typeof existingMedia[0] | undefined;
+    mediaUrl: string;
+  }
+  const downloadTasks: DownloadTask[] = [];
+
   for (let i = 0; i < mediaRows.length; i++) {
     const row = mediaRows[i];
     const rawMedia = incomingMedia[i];
     const existingRow = existingMediaMap.get(row.mediaKey);
 
-    // Check if download is needed:
-    // - New media (no existing row)
-    // - MediaModificationTimestamp changed
-    // - Previously expired/failed/pending (needs fresh URL download)
+    // Check if download is needed
     const needsDownload =
       !existingRow ||
       existingRow.status !== 'complete' ||
@@ -408,7 +414,6 @@ async function downloadMediaInline(
         existingRow.mediaModTs?.toISOString() !== row.mediaModTs.toISOString());
 
     if (!needsDownload) {
-      // Media unchanged — just update metadata
       await db
         .insert(media)
         .values({ ...row, status: 'complete' })
@@ -424,12 +429,7 @@ async function downloadMediaInline(
       continue;
     }
 
-    // Fast-path: if the row already has a valid R2 object key and public URL
-    // (and a non-null file size proving the download completed), the image was
-    // previously downloaded successfully. Even if the MLS Grid URL is now expired,
-    // we don't need to re-download — just restore status to complete and update
-    // metadata. This prevents replication from re-marking 'expired' rows that are
-    // already safely stored in R2.
+    // Fast-path: already in R2
     if (
       existingRow?.r2ObjectKey &&
       existingRow.r2ObjectKey.length > 0 &&
@@ -447,21 +447,15 @@ async function downloadMediaInline(
           updatedAt: new Date(),
         })
         .where(eq(media.mediaKey, row.mediaKey));
-      logger.debug(
-        { mediaKey: row.mediaKey, listingKey },
-        'Media already in R2 — restoring complete status without re-download',
-      );
       skipped++;
       continue;
     }
 
-    // Resolve the download URL: prefer fresh URL from API re-fetch, fall back to
-    // the URL from the original replication page.
+    // Resolve URL
     const originalUrl = rawMedia.MediaURL;
     const mediaUrl = freshUrlMap?.get(row.mediaKey) ?? originalUrl;
 
     if (!mediaUrl) {
-      // No URL — insert as failed
       await db
         .insert(media)
         .values({ ...row, status: 'failed' })
@@ -473,16 +467,9 @@ async function downloadMediaInline(
       continue;
     }
 
-    // Pre-flight: if the URL token is already expired (even after fresh fetch),
-    // mark as expired so recoverFailedMedia() can retry later.
+    // Pre-flight expired check
     if (isMediaUrlExpired(mediaUrl)) {
-      // If the record is already marked expired, don't re-upsert — avoid
-      // unnecessary writes and potential data loss on the conflict path.
       if (existingRow?.status === 'expired') {
-        logger.debug(
-          { mediaKey: row.mediaKey, listingKey },
-          'Media URL still expired — already marked, skipping',
-        );
         skipped++;
         continue;
       }
@@ -493,135 +480,129 @@ async function downloadMediaInline(
           target: media.mediaKey,
           set: { status: 'expired', mediaUrlSource: mediaUrl, updatedAt: new Date() },
         });
-      logger.debug(
-        { mediaKey: row.mediaKey, listingKey },
-        'Media URL already expired — marking for recovery',
-      );
       failed++;
       continue;
     }
 
-    // Download and upload with retry
-    let success = false;
-    for (let attempt = 0; attempt < MEDIA_MAX_RETRIES; attempt++) {
-      try {
-        const result = await downloadMedia(mediaUrl);
+    // Needs actual download — add to task list
+    downloadTasks.push({ row, rawMedia, existingRow, mediaUrl });
+  }
 
-        // Build R2 key with actual content type
-        const r2ObjectKey = buildR2ObjectKey(resourceType, listingKey, row.mediaKey, result.contentType);
-        const publicUrl = buildPublicUrl(r2ObjectKey);
+  // Phase 2: Download in concurrent batches
+  const INLINE_CONCURRENCY = env.WORKER_INLINE_MEDIA_CONCURRENCY;
 
-        // Upload to R2
-        await uploadToR2(r2ObjectKey, result.buffer, result.contentType);
+  for (let batchStart = 0; batchStart < downloadTasks.length; batchStart += INLINE_CONCURRENCY) {
+    const batch = downloadTasks.slice(batchStart, batchStart + INLINE_CONCURRENCY);
 
-        // Upsert media row as complete
+    const results = await Promise.allSettled(
+      batch.map(async (task) => {
+        const { row, existingRow, mediaUrl } = task;
+
+        for (let attempt = 0; attempt < MEDIA_MAX_RETRIES; attempt++) {
+          try {
+            const result = await downloadMedia(mediaUrl);
+            const r2ObjectKey = buildR2ObjectKey(resourceType, listingKey, row.mediaKey, result.contentType);
+            const publicUrl = buildPublicUrl(r2ObjectKey);
+
+            await uploadToR2(r2ObjectKey, result.buffer, result.contentType);
+
+            await db
+              .insert(media)
+              .values({
+                ...row,
+                status: 'complete',
+                r2ObjectKey,
+                publicUrl,
+                fileSizeBytes: result.bytes,
+                contentType: result.contentType,
+              })
+              .onConflictDoUpdate({
+                target: media.mediaKey,
+                set: {
+                  status: 'complete',
+                  r2ObjectKey,
+                  publicUrl,
+                  mediaUrlSource: row.mediaUrlSource,
+                  mediaModTs: row.mediaModTs,
+                  mediaOrder: row.mediaOrder,
+                  fileSizeBytes: result.bytes,
+                  contentType: result.contentType,
+                  updatedAt: new Date(),
+                },
+              });
+
+            logger.debug(
+              { mediaKey: row.mediaKey, bytes: result.bytes, listingKey },
+              'Media downloaded inline',
+            );
+            return 'downloaded' as const;
+          } catch (err) {
+            const is429 = err instanceof MlsGridApiError && err.statusCode === 429;
+            const isExpiredUrl = err instanceof MlsGridApiError && (err.statusCode === 400 || err.statusCode === 403);
+
+            if (isExpiredUrl) {
+              if (
+                existingRow?.publicUrl &&
+                existingRow.fileSizeBytes != null &&
+                existingRow.fileSizeBytes > 0
+              ) {
+                return 'skipped' as const;
+              }
+              await db
+                .insert(media)
+                .values({ ...row, status: 'expired', mediaUrlSource: mediaUrl })
+                .onConflictDoUpdate({
+                  target: media.mediaKey,
+                  set: { status: 'expired', mediaUrlSource: mediaUrl, updatedAt: new Date() },
+                });
+              return 'expired' as const;
+            }
+            if (is429 && attempt < MEDIA_MAX_RETRIES - 1) {
+              const waitMs = 30_000 * (attempt + 1);
+              logger.warn(
+                { mediaKey: row.mediaKey, attempt: attempt + 1, waitMs },
+                'Media download 429 — waiting before retry',
+              );
+              await sleep(waitMs);
+              continue;
+            }
+            if (attempt < MEDIA_MAX_RETRIES - 1) {
+              await sleep(2_000 * (attempt + 1));
+              continue;
+            }
+            logger.error(
+              { mediaKey: row.mediaKey, listingKey, err: (err as Error).message },
+              'Media download failed after retries',
+            );
+          }
+        }
+
+        // All retries exhausted
         await db
           .insert(media)
-          .values({
-            ...row,
-            status: 'complete',
-            r2ObjectKey,
-            publicUrl,
-            fileSizeBytes: result.bytes,
-            contentType: result.contentType,
-          })
+          .values({ ...row, status: 'failed' })
           .onConflictDoUpdate({
             target: media.mediaKey,
-            set: {
-              status: 'complete',
-              r2ObjectKey,
-              publicUrl,
-              mediaUrlSource: row.mediaUrlSource,
-              mediaModTs: row.mediaModTs,
-              mediaOrder: row.mediaOrder,
-              fileSizeBytes: result.bytes,
-              contentType: result.contentType,
-              updatedAt: new Date(),
-            },
+            set: { status: 'failed', retryCount: MEDIA_MAX_RETRIES, updatedAt: new Date() },
           });
+        return 'failed' as const;
+      }),
+    );
 
-        downloaded++;
-        success = true;
-
-        logger.debug(
-          { mediaKey: row.mediaKey, bytes: result.bytes, listingKey },
-          'Media downloaded inline',
-        );
-        break;
-      } catch (err) {
-        const is429 = err instanceof MlsGridApiError && err.statusCode === 429;
-        const isExpiredUrl = err instanceof MlsGridApiError && (err.statusCode === 400 || err.statusCode === 403);
-
-        if (isExpiredUrl) {
-          // 400/403 = URL token expired mid-download.
-          // If the record already has valid R2 data from a previous download,
-          // keep it as complete — the existing image is still valid.
-          if (
-            existingRow?.publicUrl &&
-            existingRow.fileSizeBytes != null &&
-            existingRow.fileSizeBytes > 0
-          ) {
-            logger.debug(
-              { mediaKey: row.mediaKey, listingKey, statusCode: (err as MlsGridApiError).statusCode },
-              'Media URL expired (400/403) but existing R2 data is valid — keeping complete',
-            );
-            success = true;
-            break;
-          }
-          // No existing R2 data — mark as expired so recoverFailedMedia()
-          // fetches a fresh URL.
-          await db
-            .insert(media)
-            .values({ ...row, status: 'expired', mediaUrlSource: mediaUrl })
-            .onConflictDoUpdate({
-              target: media.mediaKey,
-              set: { status: 'expired', mediaUrlSource: mediaUrl, updatedAt: new Date() },
-            });
-          logger.debug(
-            { mediaKey: row.mediaKey, listingKey, statusCode: (err as MlsGridApiError).statusCode },
-            'Media URL expired (400/403) during download — marking for recovery',
-          );
-          success = true; // Prevent the failed-insert block below from overwriting
-          break;
+    // Tally results
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        switch (result.value) {
+          case 'downloaded': downloaded++; break;
+          case 'skipped': skipped++; break;
+          case 'expired': failed++; break;
+          case 'failed': failed++; break;
         }
-        if (is429 && attempt < MEDIA_MAX_RETRIES - 1) {
-          // Wait longer on 429
-          const waitMs = 30_000 * (attempt + 1); // 30s, 60s, 90s
-          logger.warn(
-            { mediaKey: row.mediaKey, attempt: attempt + 1, waitMs },
-            'Media download 429 — waiting before retry',
-          );
-          await sleep(waitMs);
-          continue;
-        }
-        if (attempt < MEDIA_MAX_RETRIES - 1) {
-          // Non-429 error — brief backoff
-          await sleep(2_000 * (attempt + 1));
-          continue;
-        }
-        // Final attempt failed
-        logger.error(
-          { mediaKey: row.mediaKey, listingKey, err: (err as Error).message },
-          'Media download failed after retries',
-        );
+      } else {
+        // Promise rejected (unexpected)
+        failed++;
+        logger.error({ err: result.reason }, 'Unexpected error in media download batch');
       }
-    }
-
-    if (!success) {
-      // Insert/update as failed
-      await db
-        .insert(media)
-        .values({ ...row, status: 'failed' })
-        .onConflictDoUpdate({
-          target: media.mediaKey,
-          set: { status: 'failed', retryCount: MEDIA_MAX_RETRIES, updatedAt: new Date() },
-        });
-      failed++;
-    }
-
-    // Stagger between downloads to avoid CDN rate limits
-    if (i < mediaRows.length - 1) {
-      await sleep(MEDIA_DOWNLOAD_STAGGER_MS);
     }
   }
 
