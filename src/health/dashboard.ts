@@ -41,16 +41,18 @@ export async function getDashboardData() {
       ORDER BY 1
     `);
 
-    // 4. Images downloaded per hour (last 24h) from media_downloads
+    // 4. Images completed per hour (last 24h) from media table
+    // Uses the media table directly since inline downloads don't log to media_downloads
     const imagesPerHourRows = await db.execute(sql`
       SELECT
-        date_trunc('hour', downloaded_at) as hour,
+        date_trunc('hour', updated_at) as hour,
         count(*)::int as count,
-        count(CASE WHEN status = 'success' THEN 1 END)::int as success,
-        count(CASE WHEN status = 'failed' THEN 1 END)::int as failed,
-        coalesce(sum(CASE WHEN status = 'success' THEN file_size_bytes ELSE 0 END), 0)::bigint as bytes
-      FROM media_downloads
-      WHERE downloaded_at >= NOW() - INTERVAL '24 hours'
+        count(CASE WHEN status = 'complete' THEN 1 END)::int as success,
+        count(CASE WHEN status IN ('failed', 'expired') THEN 1 END)::int as failed,
+        coalesce(sum(CASE WHEN status = 'complete' THEN file_size_bytes ELSE 0 END), 0)::bigint as bytes
+      FROM media
+      WHERE updated_at >= NOW() - INTERVAL '24 hours'
+        AND file_size_bytes IS NOT NULL
       GROUP BY 1
       ORDER BY 1
     `);
