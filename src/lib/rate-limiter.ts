@@ -42,6 +42,7 @@ interface TimestampedEntry {
 export class RateLimiter {
   private apiRequests: TimestampedEntry[] = [];
   private mediaDownloads: TimestampedEntry[] = [];
+  private apiSlotLock: Promise<void> = Promise.resolve();
 
   /**
    * Initialize counters from database records (for restart recovery).
@@ -155,16 +156,31 @@ export class RateLimiter {
 
   /**
    * Wait until an API request is allowed, then record it.
+   * Uses a promise-chain mutex to serialize concurrent callers and prevent
+   * TOCTOU race conditions where multiple callers check simultaneously,
+   * all see < 2 requests, and all proceed — causing bursts above the limit.
    */
   async waitForApiSlot(): Promise<void> {
-    let waitMs = this.checkApiRequest();
-    while (waitMs > 0) {
-      const logger = getLogger();
-      logger.warn({ waitMs }, 'Rate limiter: waiting for API slot');
-      await sleep(waitMs);
-      waitMs = this.checkApiRequest();
+    // Chain onto the previous caller's promise so only one caller
+    // can check + record at a time.
+    const previous = this.apiSlotLock;
+    let resolve!: () => void;
+    this.apiSlotLock = new Promise<void>((r) => { resolve = r; });
+
+    await previous; // Wait for the previous caller to finish
+
+    try {
+      let waitMs = this.checkApiRequest();
+      while (waitMs > 0) {
+        const logger = getLogger();
+        logger.warn({ waitMs }, 'Rate limiter: waiting for API slot');
+        await sleep(waitMs);
+        waitMs = this.checkApiRequest();
+      }
+      this.recordApiRequest();
+    } finally {
+      resolve(); // Release the lock for the next caller
     }
-    this.recordApiRequest();
   }
 
   /**

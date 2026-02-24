@@ -202,16 +202,11 @@ export class MediaDownloader {
 
       const listingIdMap = new Map(propRows.map((r) => [r.listingKey, r.listingId]));
 
-      // Fetch fresh records in batches to respect rate limits
-      const BATCH_SIZE = 10;
-      const listingKeyBatches: string[][] = [];
-      for (let i = 0; i < listingKeys.length; i += BATCH_SIZE) {
-        listingKeyBatches.push(listingKeys.slice(i, i + BATCH_SIZE));
-      }
-
-      for (const batch of listingKeyBatches) {
-        await Promise.all(
-          batch.map(async (listingKey) => {
+      // Fetch fresh records sequentially to respect rate limits.
+      // Previous batch size of 10 caused race conditions in the rate limiter
+      // because concurrent callers could all check and proceed simultaneously.
+      for (const listingKey of listingKeys) {
+        await (async () => {
             const listingId = listingIdMap.get(listingKey);
             if (!listingId) {
               logger.warn({ listingKey }, 'Media recovery: no listingId found — marking media failed');
@@ -262,8 +257,7 @@ export class MediaDownloader {
               const ok = await this.recoverOne(row, freshUrl);
               if (ok) recovered++; else stillFailed++;
             }
-          }),
-        );
+        })();
       }
     }
 
