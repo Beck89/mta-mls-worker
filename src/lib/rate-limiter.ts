@@ -9,8 +9,7 @@ import { getLogger } from './logger.js';
  *   - 7,200 requests per hour (soft cap 6,000)
  *   - 40,000 requests per 24 hours (soft cap 35,000)
  *
- * Dimension 2: Media download bytes (CDN, not API endpoint) — fixed clock-hour window
- *   Resets at the top of every UTC hour, matching MLS Grid's own billing window.
+ * Dimension 2: Media download bytes (CDN, not API endpoint) — rolling 60-minute window
  *   Caps are configurable via WORKER_MEDIA_BANDWIDTH_HARD_CAP_GB / WORKER_MEDIA_BANDWIDTH_SOFT_CAP_GB.
  */
 
@@ -53,16 +52,16 @@ export class RateLimiter {
   ): void {
     const now = Date.now();
     const dayAgo = now - ONE_DAY;
-    const startOfHour = now - (now % ONE_HOUR);
+    const oneHourAgo = now - ONE_HOUR;
 
     this.apiRequests = apiRequestTimestamps
       .map((ts) => ({ timestamp: ts.getTime() }))
       .filter((e) => e.timestamp > dayAgo);
 
-    // Only load entries from the current clock hour — matches MLS Grid's fixed reset window
+    // Load entries from the rolling 60-minute window
     this.mediaDownloads = mediaDownloadEntries
       .map((e) => ({ timestamp: e.timestamp.getTime(), bytes: Number(e.bytes) }))
-      .filter((e) => e.timestamp >= startOfHour);
+      .filter((e) => e.timestamp >= oneHourAgo);
 
     const logger = getLogger();
     logger.info(
@@ -128,19 +127,21 @@ export class RateLimiter {
   checkMediaDownload(): number {
     this.pruneMediaDownloads();
     const now = Date.now();
-    const startOfHour = now - (now % ONE_HOUR);
+    const oneHourAgo = now - ONE_HOUR;
     const mediaLimits = getMediaLimits();
 
-    const currentHourBytes = this.mediaDownloads
-      .filter((e) => e.timestamp >= startOfHour)
+    const rollingHourBytes = this.mediaDownloads
+      .filter((e) => e.timestamp >= oneHourAgo)
       .reduce((sum, e) => sum + Number(e.bytes ?? 0), 0);
 
-    if (currentHourBytes >= mediaLimits.hard) {
-      // Wait until the top of the next hour
-      return startOfHour + ONE_HOUR - now + 100; // +100ms buffer past the reset
+    if (rollingHourBytes >= mediaLimits.hard) {
+      // Find the oldest entry in the window — wait until it falls out
+      const oldest = Math.min(...this.mediaDownloads.filter((e) => e.timestamp >= oneHourAgo).map((e) => e.timestamp));
+      const waitMs = oldest + ONE_HOUR - now + 100; // +100ms buffer
+      return Math.max(waitMs, 1_000); // At least 1s
     }
 
-    if (currentHourBytes >= mediaLimits.soft) {
+    if (rollingHourBytes >= mediaLimits.soft) {
       return 10_000; // 10s pause approaching bandwidth limit
     }
 
@@ -198,20 +199,20 @@ export class RateLimiter {
 
   /**
    * Get current usage stats for health check reporting.
-   * Media bytes use the fixed clock-hour window to match MLS Grid's billing window.
+   * Media bytes use a rolling 60-minute window.
    */
   getUsageStats() {
     this.pruneApiRequests();
     this.pruneMediaDownloads();
     const now = Date.now();
-    const startOfHour = now - (now % ONE_HOUR);
+    const oneHourAgo = now - ONE_HOUR;
     const mediaLimits = getMediaLimits();
 
     const apiLastSecond = this.apiRequests.filter((e) => e.timestamp > now - ONE_SECOND).length;
     const apiLastHour = this.apiRequests.filter((e) => e.timestamp > now - ONE_HOUR).length;
     const apiLastDay = this.apiRequests.filter((e) => e.timestamp > now - ONE_DAY).length;
-    const mediaCurrentHourBytes = this.mediaDownloads
-      .filter((e) => e.timestamp >= startOfHour)
+    const mediaRollingHourBytes = this.mediaDownloads
+      .filter((e) => e.timestamp >= oneHourAgo)
       .reduce((sum, e) => sum + Number(e.bytes ?? 0), 0);
 
     return {
@@ -222,10 +223,10 @@ export class RateLimiter {
       },
       media: {
         currentHourBytes: {
-          current: mediaCurrentHourBytes,
+          current: mediaRollingHourBytes,
           limit: mediaLimits.hard,
           softLimit: mediaLimits.soft,
-          percentUsed: Math.round((mediaCurrentHourBytes / mediaLimits.hard) * 100),
+          percentUsed: Math.round((mediaRollingHourBytes / mediaLimits.hard) * 100),
         },
       },
     };
@@ -237,10 +238,9 @@ export class RateLimiter {
   }
 
   private pruneMediaDownloads(): void {
-    // Keep only entries from the current clock hour — older ones can never affect the limit again
-    const now = Date.now();
-    const startOfHour = now - (now % ONE_HOUR);
-    this.mediaDownloads = this.mediaDownloads.filter((e) => e.timestamp >= startOfHour);
+    // Keep only entries from the rolling 60-minute window
+    const cutoff = Date.now() - ONE_HOUR;
+    this.mediaDownloads = this.mediaDownloads.filter((e) => e.timestamp >= cutoff);
   }
 }
 

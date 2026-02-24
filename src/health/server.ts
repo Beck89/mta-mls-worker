@@ -4,6 +4,7 @@ import { getDb } from '../db/connection.js';
 import { replicationRuns } from '../db/schema/monitoring.js';
 import { getRateLimiter } from '../lib/rate-limiter.js';
 import { getLogger } from '../lib/logger.js';
+import { getDashboardData, renderDashboardHtml } from './dashboard.js';
 
 let _server: ReturnType<typeof Fastify> | null = null;
 
@@ -108,6 +109,32 @@ export async function startHealthServer(port: number): Promise<void> {
   // Simple liveness probe
   _server.get('/live', async (_request: FastifyRequest, reply: FastifyReply) => {
     return reply.code(200).send({ status: 'alive' });
+  });
+
+  // Dashboard — HTML page with charts (auto-refreshes every 15s)
+  _server.get('/dashboard', async (_request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const data = await getDashboardData();
+      const html = renderDashboardHtml(data);
+      return reply.code(200).type('text/html').send(html);
+    } catch (err) {
+      getLogger().error({ err }, 'Dashboard error');
+      return reply.code(500).type('text/html').send(
+        '<html><body style="background:#0f172a;color:#f87171;padding:40px;font-family:sans-serif">' +
+        '<h1>Dashboard Error</h1><pre>' + (err instanceof Error ? err.message : String(err)) + '</pre></body></html>',
+      );
+    }
+  });
+
+  // Dashboard JSON API (for programmatic access)
+  _server.get('/dashboard/data', async (_request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const data = await getDashboardData();
+      return reply.code(200).send(data);
+    } catch (err) {
+      getLogger().error({ err }, 'Dashboard data error');
+      return reply.code(500).send({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   await _server.listen({ port, host: '0.0.0.0' });
