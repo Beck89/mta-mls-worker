@@ -100,15 +100,22 @@ export async function getDashboardData() {
       rateLimiterStats = getRateLimiter().getUsageStats();
     } catch { /* not initialized */ }
 
+    // db.execute() returns QueryResult with .rows property (node-postgres)
+    const rows = (result: unknown): any[] => {
+      if (Array.isArray(result)) return result;
+      if (result && typeof result === 'object' && 'rows' in result) return (result as any).rows;
+      return [];
+    };
+
     return {
-      mediaStatus: mediaStatusRows as unknown as Array<{ status: string; count: number }>,
-      properties: (propCountRows as unknown as Array<{ total: number; active: number }>)[0] ?? { total: 0, active: 0 },
-      propsPerHour: propsPerHourRows as unknown as Array<{ hour: string; inserted: number; updated: number; total_received: number }>,
-      imagesPerHour: imagesPerHourRows as unknown as Array<{ hour: string; count: number; success: number; failed: number; bytes: string }>,
-      apiRps: apiRpsRows as unknown as Array<{ minute: string; requests: number; rate_limited: number }>,
-      recentRuns: recentRunsRows as unknown as Array<Record<string, unknown>>,
-      recent429Count: ((recent429Rows as unknown as Array<{ count: number }>)[0]?.count) ?? 0,
-      totalMediaBytes: Number(((totalMediaBytesRows as unknown as Array<{ total_bytes: string }>)[0]?.total_bytes) ?? 0),
+      mediaStatus: rows(mediaStatusRows) as Array<{ status: string; count: number }>,
+      properties: (rows(propCountRows) as Array<{ total: number; active: number }>)[0] ?? { total: 0, active: 0 },
+      propsPerHour: rows(propsPerHourRows) as Array<{ hour: string; inserted: number; updated: number; total_received: number }>,
+      imagesPerHour: rows(imagesPerHourRows) as Array<{ hour: string; count: number; success: number; failed: number; bytes: string }>,
+      apiRps: rows(apiRpsRows) as Array<{ minute: string; requests: number; rate_limited: number }>,
+      recentRuns: rows(recentRunsRows) as Array<Record<string, unknown>>,
+      recent429Count: ((rows(recent429Rows) as Array<{ count: number }>)[0]?.count) ?? 0,
+      totalMediaBytes: Number(((rows(totalMediaBytesRows) as Array<{ total_bytes: string }>)[0]?.total_bytes) ?? 0),
       rateLimiter: rateLimiterStats,
       timestamp: new Date().toISOString(),
     };
