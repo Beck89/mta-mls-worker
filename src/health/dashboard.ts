@@ -81,9 +81,11 @@ export async function getDashboardData() {
       LIMIT 20
     `);
 
-    // 7. Recent 429 errors (last 24h)
+    // 7. Recent 429 errors (last 60m and last 24h)
     const recent429Rows = await db.execute(sql`
-      SELECT count(*)::int as count
+      SELECT
+        count(CASE WHEN requested_at >= NOW() - INTERVAL '60 minutes' THEN 1 END)::int as count_60m,
+        count(*)::int as count_24h
       FROM replication_requests
       WHERE http_status = 429
         AND requested_at >= NOW() - INTERVAL '24 hours'
@@ -94,6 +96,16 @@ export async function getDashboardData() {
       SELECT coalesce(sum(file_size_bytes), 0)::bigint as total_bytes
       FROM media
       WHERE status = 'complete'
+    `);
+
+    // 8b. Rolling 60-minute media bandwidth from DB (more accurate than in-memory rate limiter)
+    const rolling60mBytesRows = await db.execute(sql`
+      SELECT coalesce(sum(file_size_bytes), 0)::bigint as bytes_60m,
+             count(*)::int as count_60m
+      FROM media
+      WHERE status = 'complete'
+        AND file_size_bytes IS NOT NULL
+        AND updated_at >= NOW() - INTERVAL '60 minutes'
     `);
 
     // 9. Rate limiter stats
@@ -116,8 +128,11 @@ export async function getDashboardData() {
       imagesPerHour: rows(imagesPerHourRows) as Array<{ hour: string; count: number; success: number; failed: number; bytes: string }>,
       apiRps: rows(apiRpsRows) as Array<{ minute: string; requests: number; rate_limited: number }>,
       recentRuns: rows(recentRunsRows) as Array<Record<string, unknown>>,
-      recent429Count: ((rows(recent429Rows) as Array<{ count: number }>)[0]?.count) ?? 0,
+      recent429Count24h: ((rows(recent429Rows) as Array<{ count_24h: number }>)[0]?.count_24h) ?? 0,
+      recent429Count60m: ((rows(recent429Rows) as Array<{ count_60m: number }>)[0]?.count_60m) ?? 0,
       totalMediaBytes: Number(((rows(totalMediaBytesRows) as Array<{ total_bytes: string }>)[0]?.total_bytes) ?? 0),
+      rolling60mBytes: Number(((rows(rolling60mBytesRows) as Array<{ bytes_60m: string }>)[0]?.bytes_60m) ?? 0),
+      rolling60mCount: ((rows(rolling60mBytesRows) as Array<{ count_60m: number }>)[0]?.count_60m) ?? 0,
       rateLimiter: rateLimiterStats,
       timestamp: new Date().toISOString(),
     };
@@ -148,9 +163,11 @@ export function renderDashboardHtml(data: Awaited<ReturnType<typeof getDashboard
   const apiLastSec = rl?.api?.lastSecond?.current ?? 0;
   const apiLastHour = rl?.api?.lastHour?.current ?? 0;
   const apiLastDay = rl?.api?.lastDay?.current ?? 0;
-  const mediaHourPct = rl?.media?.currentHourBytes?.percentUsed ?? 0;
-  const mediaHourGB = rl ? (rl.media.currentHourBytes.current / (1024 * 1024 * 1024)).toFixed(2) : '0';
-  const mediaHourLimitGB = rl ? (rl.media.currentHourBytes.limit / (1024 * 1024 * 1024)).toFixed(1) : '0';
+  // Use DB-based rolling 60m bandwidth (more accurate than in-memory rate limiter)
+  const mediaHourLimitBytes = rl?.media?.currentHourBytes?.limit ?? (4 * 1024 * 1024 * 1024);
+  const mediaHourLimitGB = (mediaHourLimitBytes / (1024 * 1024 * 1024)).toFixed(1);
+  const rolling60mGB = (data.rolling60mBytes / (1024 * 1024 * 1024)).toFixed(2);
+  const rolling60mPct = Math.round((data.rolling60mBytes / mediaHourLimitBytes) * 100);
 
   // Pass raw ISO timestamps — browser JS will convert to local time
   const propsHourTimestamps = data.propsPerHour.map(r => r.hour);
@@ -277,17 +294,17 @@ export function renderDashboardHtml(data: Awaited<ReturnType<typeof getDashboard
       <div class="sub">Limit: 2/sec | Hour: ${apiLastHour}/7,200 | Day: ${apiLastDay}/40,000</div>
     </div>
     <div class="card">
-      <h3>Media Bandwidth (this hour)</h3>
-      <div class="value">${mediaHourGB} GB</div>
-      <div class="sub">${mediaHourPct}% of ${mediaHourLimitGB} GB cap</div>
+      <h3>Media Bandwidth (last 60 min)</h3>
+      <div class="value">${rolling60mGB} GB</div>
+      <div class="sub">${rolling60mPct}% of ${mediaHourLimitGB} GB cap · ${data.rolling60mCount.toLocaleString()} files</div>
       <div class="progress-bar">
-        <div class="progress-fill ${mediaHourPct > 80 ? 'progress-red' : mediaHourPct > 50 ? 'progress-yellow' : 'progress-green'}" style="width: ${Math.min(mediaHourPct, 100)}%"></div>
+        <div class="progress-fill ${rolling60mPct > 80 ? 'progress-red' : rolling60mPct > 50 ? 'progress-yellow' : 'progress-green'}" style="width: ${Math.min(rolling60mPct, 100)}%"></div>
       </div>
     </div>
     <div class="card">
-      <h3>429 Errors (24h)</h3>
-      <div class="value" style="color: ${data.recent429Count > 0 ? '#f87171' : '#4ade80'}">${data.recent429Count}</div>
-      <div class="sub">Rate limit hits</div>
+      <h3>429 Errors</h3>
+      <div class="value" style="color: ${data.recent429Count60m > 0 ? '#f87171' : '#4ade80'}">${data.recent429Count60m}</div>
+      <div class="sub">Last 60 min · ${data.recent429Count24h} in 24h</div>
     </div>
     <div class="card">
       <h3>Media Status</h3>
