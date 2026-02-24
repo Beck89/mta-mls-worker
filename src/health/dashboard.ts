@@ -26,17 +26,21 @@ export async function getDashboardData() {
       FROM properties
     `);
 
-    // 3. Properties added per hour (last 24h) from replication_runs
+    // 3. Properties fully ready per hour (last 24h)
+    // A property is "fully ready" when it exists in properties AND all its media is complete
     const propsPerHourRows = await db.execute(sql`
       SELECT
-        date_trunc('hour', completed_at) as hour,
-        sum(records_inserted)::int as inserted,
-        sum(records_updated)::int as updated,
-        sum(total_records_received)::int as total_received
-      FROM replication_runs
-      WHERE resource_type = 'Property'
-        AND completed_at >= NOW() - INTERVAL '24 hours'
-        AND status IN ('completed', 'partial')
+        date_trunc('hour', p.created_at) as hour,
+        count(*)::int as inserted,
+        0::int as updated
+      FROM properties p
+      WHERE p.created_at >= NOW() - INTERVAL '24 hours'
+        AND p.deleted_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM media m
+          WHERE m.listing_key = p.listing_key
+            AND m.status != 'complete'
+        )
       GROUP BY 1
       ORDER BY 1
     `);
@@ -172,7 +176,6 @@ export function renderDashboardHtml(data: Awaited<ReturnType<typeof getDashboard
   // Pass raw ISO timestamps — browser JS will convert to local time
   const propsHourTimestamps = data.propsPerHour.map(r => r.hour);
   const propsInserted = data.propsPerHour.map(r => r.inserted);
-  const propsUpdated = data.propsPerHour.map(r => r.updated);
 
   const imgHourTimestamps = data.imagesPerHour.map(r => r.hour);
   const imgSuccess = data.imagesPerHour.map(r => r.success);
@@ -320,7 +323,7 @@ export function renderDashboardHtml(data: Awaited<ReturnType<typeof getDashboard
   <!-- Charts -->
   <div class="grid grid-2">
     <div class="card">
-      <h3>Properties Added / Updated (24h)</h3>
+      <h3>Properties Fully Ready (24h)</h3>
       <div class="chart-container">
         <canvas id="propsChart"></canvas>
       </div>
@@ -422,8 +425,7 @@ export function renderDashboardHtml(data: Awaited<ReturnType<typeof getDashboard
       data: {
         labels: propsHourLabels,
         datasets: [
-          { label: 'Inserted', data: ${JSON.stringify(propsInserted)}, backgroundColor: '#4ade80', borderRadius: 3 },
-          { label: 'Updated', data: ${JSON.stringify(propsUpdated)}, backgroundColor: '#38bdf8', borderRadius: 3 },
+          { label: 'Fully Ready', data: ${JSON.stringify(propsInserted)}, backgroundColor: '#4ade80', borderRadius: 3 },
         ],
       },
       options: { ...chartDefaults, plugins: { ...chartDefaults.plugins, tooltip: { mode: 'index', intersect: false } } },
