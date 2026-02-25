@@ -2,6 +2,8 @@ import { eq, inArray, or } from 'drizzle-orm';
 import { getDb } from '../db/connection.js';
 import { media } from '../db/schema/media.js';
 import { properties } from '../db/schema/properties.js';
+import { members } from '../db/schema/members.js';
+import { offices } from '../db/schema/offices.js';
 import { mediaDownloads } from '../db/schema/monitoring.js';
 import { downloadMedia, fetchPage, MlsGridApiError } from '../api/mlsgrid-client.js';
 import { uploadToR2, buildR2ObjectKey, buildPublicUrl } from '../storage/r2-client.js';
@@ -192,32 +194,85 @@ export class MediaDownloader {
         byListing.set(row.listingKey, group);
       }
 
-      const listingKeys = [...byListing.keys()];
+      const parentKeys = [...byListing.keys()];
 
-      // Look up listingId for each listingKey (needed for API filter)
-      const propRows = await db
-        .select({ listingKey: properties.listingKey, listingId: properties.listingId })
-        .from(properties)
-        .where(inArray(properties.listingKey, listingKeys));
+      // Build a lookup map: parentKey → { apiUrl, resourceLabel }
+      // We need to query the correct API endpoint based on resourceType.
+      // Group keys by resource type so we can batch-lookup MLS IDs from the right table.
+      const propertyKeys = needFreshUrl.filter(r => r.resourceType === 'Property').map(r => r.listingKey);
+      const memberKeys   = needFreshUrl.filter(r => r.resourceType === 'Member').map(r => r.listingKey);
+      const officeKeys   = needFreshUrl.filter(r => r.resourceType === 'Office').map(r => r.listingKey);
 
-      const listingIdMap = new Map(propRows.map((r) => [r.listingKey, r.listingId]));
+      // Build parentKey → apiUrl map
+      const apiUrlMap = new Map<string, string>();
+
+      // Property: filter by ListingId
+      if (propertyKeys.length > 0) {
+        const propRows = await db
+          .select({ listingKey: properties.listingKey, listingId: properties.listingId })
+          .from(properties)
+          .where(inArray(properties.listingKey, [...new Set(propertyKeys)]));
+        for (const r of propRows) {
+          if (r.listingId) {
+            apiUrlMap.set(r.listingKey,
+              `${env.MLSGRID_API_BASE_URL}/Property` +
+              `?$filter=${encodeURIComponent(`OriginatingSystemName eq '${env.MLSGRID_ORIGINATING_SYSTEM}' and ListingId eq '${r.listingId}'`)}` +
+              `&$expand=Media&$top=1`,
+            );
+          }
+        }
+      }
+
+      // Member: filter by MemberMlsId
+      if (memberKeys.length > 0) {
+        const memberRows = await db
+          .select({ memberKey: members.memberKey, memberMlsId: members.memberMlsId })
+          .from(members)
+          .where(inArray(members.memberKey, [...new Set(memberKeys)]));
+        for (const r of memberRows) {
+          if (r.memberMlsId) {
+            apiUrlMap.set(r.memberKey,
+              `${env.MLSGRID_API_BASE_URL}/Member` +
+              `?$filter=${encodeURIComponent(`OriginatingSystemName eq '${env.MLSGRID_ORIGINATING_SYSTEM}' and MemberMlsId eq '${r.memberMlsId}'`)}` +
+              `&$expand=Media&$top=1`,
+            );
+          }
+        }
+      }
+
+      // Office: filter by OfficeMlsId
+      if (officeKeys.length > 0) {
+        const officeRows = await db
+          .select({ officeKey: offices.officeKey, officeMlsId: offices.officeMlsId })
+          .from(offices)
+          .where(inArray(offices.officeKey, [...new Set(officeKeys)]));
+        for (const r of officeRows) {
+          if (r.officeMlsId) {
+            apiUrlMap.set(r.officeKey,
+              `${env.MLSGRID_API_BASE_URL}/Office` +
+              `?$filter=${encodeURIComponent(`OriginatingSystemName eq '${env.MLSGRID_ORIGINATING_SYSTEM}' and OfficeMlsId eq '${r.officeMlsId}'`)}` +
+              `&$expand=Media&$top=1`,
+            );
+          }
+        }
+      }
 
       // Fetch fresh records in small batches. The rate limiter mutex serializes
       // concurrent waitForApiSlot() calls, so 2 concurrent callers safely
       // alternate at ~2 RPS without race conditions.
       const BATCH_SIZE = 2;
-      const listingKeyBatches: string[][] = [];
-      for (let i = 0; i < listingKeys.length; i += BATCH_SIZE) {
-        listingKeyBatches.push(listingKeys.slice(i, i + BATCH_SIZE));
+      const parentKeyBatches: string[][] = [];
+      for (let i = 0; i < parentKeys.length; i += BATCH_SIZE) {
+        parentKeyBatches.push(parentKeys.slice(i, i + BATCH_SIZE));
       }
 
-      for (const batch of listingKeyBatches) {
+      for (const batch of parentKeyBatches) {
         await Promise.all(
-          batch.map(async (listingKey) => {
-            const listingId = listingIdMap.get(listingKey);
-            if (!listingId) {
-              logger.warn({ listingKey }, 'Media recovery: no listingId found — marking media failed');
-              const rows = byListing.get(listingKey) ?? [];
+          batch.map(async (parentKey) => {
+            const apiUrl = apiUrlMap.get(parentKey);
+            if (!apiUrl) {
+              logger.warn({ parentKey }, 'Media recovery: no API URL found for parent key — marking media failed');
+              const rows = byListing.get(parentKey) ?? [];
               for (const row of rows) {
                 await db.update(media).set({ status: 'failed', updatedAt: new Date() }).where(eq(media.mediaKey, row.mediaKey));
                 stillFailed++;
@@ -225,12 +280,7 @@ export class MediaDownloader {
               return;
             }
 
-            // Fetch fresh Property record with expanded Media
-            const apiUrl =
-              `${env.MLSGRID_API_BASE_URL}/Property` +
-              `?$filter=${encodeURIComponent(`OriginatingSystemName eq '${env.MLSGRID_ORIGINATING_SYSTEM}' and ListingId eq '${listingId}'`)}` +
-              `&$expand=Media&$top=1`;
-
+            // Fetch fresh record with expanded Media
             let freshMediaMap: Map<string, string> | null = null;
             try {
               // fetchPage honours waitForApiSlot() internally
@@ -247,14 +297,14 @@ export class MediaDownloader {
                 }
               }
             } catch (err) {
-              logger.warn({ listingKey, listingId, err }, 'Media recovery: failed to fetch fresh Property record');
+              logger.warn({ parentKey, apiUrl: apiUrl.substring(0, 100), err }, 'Media recovery: failed to fetch fresh record');
             }
 
-            const rows = byListing.get(listingKey) ?? [];
+            const rows = byListing.get(parentKey) ?? [];
             for (const row of rows) {
               const freshUrl = freshMediaMap?.get(row.mediaKey) ?? null;
               if (!freshUrl) {
-                logger.debug({ mediaKey: row.mediaKey, listingKey }, 'Media recovery: no fresh URL found — marking failed');
+                logger.debug({ mediaKey: row.mediaKey, parentKey }, 'Media recovery: no fresh URL found — marking failed');
                 await db.update(media).set({ status: 'failed', updatedAt: new Date() }).where(eq(media.mediaKey, row.mediaKey));
                 stillFailed++;
                 continue;
