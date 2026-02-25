@@ -331,16 +331,20 @@ export class MediaDownloader {
       const is429 = err instanceof MlsGridApiError && err.statusCode === 429;
 
       if (is429) {
-        // 429 from CDN during recovery — leave as expired so the next recovery
-        // run can retry it. Don't permanently mark failed.
+        // 429 from CDN during recovery — reset to pending_download so the
+        // normal download loop picks it up after the rate-limit window clears.
+        // Do NOT mark as 'expired' — that status is reserved for genuinely
+        // expired URL tokens (400/403 responses). Using 'expired' here caused
+        // records to loop through recoverFailedMedia() indefinitely without
+        // ever re-entering the pending_download queue.
         this.metrics.total429s++;
         logger.warn(
           { mediaKey: row.mediaKey },
-          'Media recovery: CDN 429 — leaving as expired for next recovery run',
+          'Media recovery: CDN 429 — resetting to pending_download for retry by download loop',
         );
         await db
           .update(media)
-          .set({ status: 'expired', updatedAt: new Date() })
+          .set({ status: 'pending_download', retryCount: 0, updatedAt: new Date() })
           .where(eq(media.mediaKey, row.mediaKey));
         // Don't count as totalFailed — it's a transient rate limit
         return false;
