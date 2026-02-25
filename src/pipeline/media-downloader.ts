@@ -12,7 +12,7 @@ import { getEnv } from '../config/env.js';
 
 const MAX_RETRIES = 5; // Increased from 3 for 429 resilience
 const BACKOFF_BASE_MS = 2_000;
-const STAGGER_DELAY_MS = 200; // Delay between starting concurrent downloads
+const STAGGER_DELAY_MS = 500; // Delay between starting concurrent downloads (~2 req/sec at concurrency=3)
 const INITIAL_RATE_LIMIT_PAUSE_MS = 5 * 60_000; // 5 minute pause when 429 detected
 const MAX_RATE_LIMIT_PAUSE_MS = 15 * 60_000; // Max 15 minute pause
 
