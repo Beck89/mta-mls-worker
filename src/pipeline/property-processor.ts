@@ -160,7 +160,7 @@ export async function processPropertyRecord(
 }
 
 /**
- * Handle soft-delete when MlgCanView is false.
+ * Handle MlgCanView=false: update the flag but keep the property and its media.
  */
 async function handleSoftDelete(
   listingKey: string,
@@ -170,31 +170,36 @@ async function handleSoftDelete(
   const db = getDb();
   const logger = getLogger();
 
-  // Check if record exists
+  // Check if record exists and whether it's already marked as not viewable
   const existing = await db
-    .select({ listingKey: properties.listingKey, standardStatus: properties.standardStatus })
+    .select({
+      listingKey: properties.listingKey,
+      standardStatus: properties.standardStatus,
+      mlgCanView: properties.mlgCanView,
+    })
     .from(properties)
     .where(eq(properties.listingKey, listingKey))
     .limit(1);
 
   if (existing.length === 0) {
-    // Record doesn't exist locally — nothing to delete
+    // Record doesn't exist locally — nothing to update
     return;
   }
 
-  // Soft-delete the property
+  const alreadyHidden = existing[0].mlgCanView === false;
+
+  // Mark property as no longer viewable (keep media and do NOT set deletedAt)
   await db
     .update(properties)
     .set({
       mlgCanView: false,
-      deletedAt: new Date(),
       updatedAt: new Date(),
       modificationTs: new Date(raw.ModificationTimestamp!),
     })
     .where(eq(properties.listingKey, listingKey));
 
-  // Log status change
-  if (!options.isInitialImport) {
+  // Log status change only if this is a new transition to MlgCanView=false
+  if (!options.isInitialImport && !alreadyHidden) {
     await db.insert(statusHistory).values({
       listingKey,
       oldStatus: existing[0].standardStatus,
@@ -203,25 +208,8 @@ async function handleSoftDelete(
     });
   }
 
-  // Delete media from R2 immediately
-  const mediaRows = await db
-    .select({ r2ObjectKey: media.r2ObjectKey })
-    .from(media)
-    .where(eq(media.listingKey, listingKey));
-
-  if (mediaRows.length > 0) {
-    const keys = mediaRows.map((m) => m.r2ObjectKey);
-    try {
-      await batchDeleteFromR2(keys);
-    } catch (err) {
-      logger.error({ err, listingKey, mediaCount: keys.length }, 'Failed to delete media from R2');
-    }
-    // Delete media rows from database
-    await db.delete(media).where(eq(media.listingKey, listingKey));
-  }
-
-  // Notify (no-op in Phase 1)
-  if (!options.isInitialImport) {
+  // Notify only on new transitions (no-op in Phase 1)
+  if (!options.isInitialImport && !alreadyHidden) {
     await notifyIfNeeded({
       type: 'property_deleted',
       listingKey,
@@ -230,7 +218,7 @@ async function handleSoftDelete(
     });
   }
 
-  logger.info({ listingKey }, 'Property soft-deleted (MlgCanView=false)');
+  logger.info({ listingKey, alreadyHidden }, 'Property marked MlgCanView=false (media retained)');
 }
 
 /**
