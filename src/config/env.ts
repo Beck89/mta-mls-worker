@@ -34,6 +34,10 @@ const envSchema = z.object({
   CADENCE_OPEN_HOUSE: z.coerce.number().int().positive().default(300),
   CADENCE_LOOKUP: z.coerce.number().int().positive().default(86400),
 
+  // Database Backup
+  BACKUP_ENABLED: z.coerce.boolean().default(true),
+  BACKUP_R2_BUCKET_NAME: z.string().default('mta-db-backups'),
+
   // Node
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
 });

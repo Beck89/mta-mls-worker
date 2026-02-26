@@ -8,6 +8,7 @@ import { rawResponses } from '../db/schema/raw-responses.js';
 import { priceHistory, statusHistory, propertyChangeLog } from '../db/schema/history.js';
 import { replicationRuns } from '../db/schema/monitoring.js';
 import { runReplicationCycle } from '../pipeline/replication-cycle.js';
+import { runDatabaseBackup, pruneBackups } from '../backup/db-backup.js';
 import { createMediaDownloader, getMediaDownloader } from '../pipeline/media-downloader.js';
 import { createRateLimiter } from '../lib/rate-limiter.js';
 import { createR2Client } from '../storage/r2-client.js';
@@ -296,6 +297,38 @@ export function createScheduler() {
           }
         }
       })();
+
+      // Schedule hourly database backup to R2 with tiered retention
+      // (hourly for 24h → daily for 30d → monthly forever)
+      if (env.BACKUP_ENABLED) {
+        const DB_BACKUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+        (async () => {
+          // Delay first backup 5 minutes after startup to let initial import settle
+          await sleep(5 * 60 * 1000);
+
+          while (isRunning) {
+            try {
+              logger.info('Hourly database backup: starting');
+              const result = await runDatabaseBackup();
+              logger.info(
+                { key: result.key, durationMs: result.durationMs },
+                'Hourly database backup: upload complete',
+              );
+
+              const pruned = await pruneBackups();
+              if (pruned > 0) {
+                logger.info({ pruned }, 'Hourly database backup: old backups pruned');
+              }
+            } catch (err) {
+              logger.error({ err }, 'Hourly database backup failed');
+            }
+
+            await sleep(DB_BACKUP_INTERVAL_MS);
+          }
+        })();
+      } else {
+        logger.info('Database backup is disabled (BACKUP_ENABLED=false)');
+      }
     },
 
     async stop(): Promise<void> {
