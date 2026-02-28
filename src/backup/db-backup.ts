@@ -52,6 +52,13 @@ export async function runDatabaseBackup(): Promise<{ key: string; durationMs: nu
   logger.info({ objectKey }, 'Starting database backup');
 
   return new Promise<{ key: string; durationMs: number }>((resolve, reject) => {
+    let settled = false;
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+
     // Spawn pg_dump streaming to stdout
     const pgDump = spawn('pg_dump', [
       env.DATABASE_URL,
@@ -89,30 +96,45 @@ export async function runDatabaseBackup(): Promise<{ key: string; durationMs: nu
       partSize: 10 * 1024 * 1024, // 10 MB parts
     });
 
+    // Start the upload IMMEDIATELY so it drains the passthrough stream.
+    // Without this, pg_dump blocks on stdout once the pipe buffer fills
+    // because nobody is consuming the other end — a deadlock.
+    const uploadPromise = upload.done();
+
+    // If the upload fails mid-stream, kill pg_dump and reject early
+    uploadPromise.catch((uploadErr) => {
+      logger.error({ err: uploadErr }, 'Backup upload to R2 failed');
+      pgDump.kill();
+      fail(uploadErr as Error);
+    });
+
     // Handle pg_dump exit
     pgDump.on('close', async (code) => {
       if (code !== 0) {
         const stderr = Buffer.concat(stderrChunks).toString();
         const err = new Error(`pg_dump exited with code ${code}: ${stderr}`);
         logger.error({ err, code, stderr }, 'pg_dump failed');
-        reject(err);
+        fail(err);
         return;
       }
 
       try {
-        await upload.done();
+        // pg_dump finished — wait for the remaining upload parts to flush
+        await uploadPromise;
         const durationMs = Date.now() - start;
         logger.info({ objectKey, durationMs }, 'Database backup completed');
-        resolve({ key: objectKey, durationMs });
+        if (!settled) {
+          settled = true;
+          resolve({ key: objectKey, durationMs });
+        }
       } catch (uploadErr) {
-        logger.error({ err: uploadErr }, 'Backup upload to R2 failed');
-        reject(uploadErr);
+        // Already handled by the uploadPromise.catch above
       }
     });
 
     pgDump.on('error', (err) => {
       logger.error({ err }, 'Failed to spawn pg_dump');
-      reject(err);
+      fail(err);
     });
   });
 }
