@@ -61,6 +61,13 @@ export interface MlsGridPropertyRecord {
   WaterfrontYN?: boolean;
   HorseYN?: boolean;
   AssociationYN?: boolean;
+  // ── NEW: Association/HOA detail fields ──
+  AssociationFee?: number;
+  AssociationFeeFrequency?: string;
+  AssociationName?: string;
+  AssociationFeeIncludes?: string[];
+  AssociationFee2?: number;
+  AssociationFee2Frequency?: string;
   Latitude?: number;
   Longitude?: number;
   StreetNumber?: string;
@@ -97,6 +104,8 @@ export interface MlsGridPropertyRecord {
   TaxAssessedValue?: number;
   TaxYear?: number;
   TaxLegalDescription?: string;
+  // ── NEW: Tax annual amount ──
+  TaxAnnualAmount?: number;
   ParcelNumber?: string;
   BuyerAgencyCompensation?: string;
   BuyerAgencyCompensationType?: string;
@@ -226,6 +235,13 @@ export function transformProperty(raw: MlsGridPropertyRecord): NewProperty {
     waterfrontYn: raw.WaterfrontYN ?? null,
     horseYn: raw.HorseYN ?? null,
     associationYn: raw.AssociationYN ?? null,
+    // ── NEW: HOA detail fields ──
+    associationFee: raw.AssociationFee?.toString() ?? null,
+    associationFeeFrequency: raw.AssociationFeeFrequency ?? null,
+    associationName: raw.AssociationName ?? null,
+    associationFeeIncludes: raw.AssociationFeeIncludes ?? null,
+    associationFee2: raw.AssociationFee2?.toString() ?? null,
+    associationFee2Frequency: raw.AssociationFee2Frequency ?? null,
 
     geog,
     latitude: lat?.toString() ?? null,
@@ -269,6 +285,8 @@ export function transformProperty(raw: MlsGridPropertyRecord): NewProperty {
     taxYear: raw.TaxYear ?? null,
     taxLegalDesc: raw.TaxLegalDescription ?? null,
     parcelNumber: raw.ParcelNumber ?? null,
+    // ── NEW: Tax annual amount ──
+    taxAnnualAmount: raw.TaxAnnualAmount?.toString() ?? null,
 
     buyerAgencyComp: raw.BuyerAgencyCompensation ?? null,
     buyerAgencyCompType: raw.BuyerAgencyCompensationType ?? null,

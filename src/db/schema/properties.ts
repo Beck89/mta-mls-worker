@@ -86,6 +86,13 @@ export const properties = pgTable(
     waterfrontYn: boolean('waterfront_yn'),
     horseYn: boolean('horse_yn'),
     associationYn: boolean('association_yn'),
+    // ── NEW: Association/HOA detail fields ──
+    associationFee: numeric('association_fee'),
+    associationFeeFrequency: varchar('association_fee_frequency'),
+    associationName: varchar('association_name'),
+    associationFeeIncludes: textArray('association_fee_includes'),
+    associationFee2: numeric('association_fee2'),
+    associationFee2Frequency: varchar('association_fee2_frequency'),
 
     // Location / Geo
     geog: geography('geog'),
@@ -134,6 +141,8 @@ export const properties = pgTable(
     taxYear: integer('tax_year'),
     taxLegalDesc: text('tax_legal_desc'),
     parcelNumber: varchar('parcel_number'),
+    // ── NEW: Tax annual amount ──
+    taxAnnualAmount: numeric('tax_annual_amount'),
 
     // Compensation
     buyerAgencyComp: varchar('buyer_agency_comp'),
